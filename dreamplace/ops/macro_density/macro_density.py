@@ -84,14 +84,19 @@ class MacroDensityUniformityOp(nn.Module):
 
         BX = self.num_bins_x
         BY = self.num_bins_y
-        density = torch.zeros(BX * BY, dtype=x.dtype, device=x.device)
 
         ix1 = (ix + 1).clamp(max=BX - 1)
         iy1 = (iy + 1).clamp(max=BY - 1)
 
-        density.scatter_add_(0, (iy  * BX + ix ).long(), w00)
-        density.scatter_add_(0, (iy  * BX + ix1).long(), w10)
-        density.scatter_add_(0, (iy1 * BX + ix ).long(), w01)
-        density.scatter_add_(0, (iy1 * BX + ix1).long(), w11)
+        indices = torch.cat([
+            iy  * BX + ix,
+            iy  * BX + ix1,
+            iy1 * BX + ix,
+            iy1 * BX + ix1,
+        ]).long()
+        weights = torch.cat([w00, w10, w01, w11])
+
+        density = torch.zeros(BX * BY, dtype=x.dtype, device=x.device)
+        density = density.scatter_add(0, indices, weights)
 
         return density.var()
