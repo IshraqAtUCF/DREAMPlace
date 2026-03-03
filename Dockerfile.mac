@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
         cmake \
         flex \
+        libfl-dev \
         bison \
         tcl \
         libboost-all-dev \
