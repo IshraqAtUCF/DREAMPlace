@@ -273,6 +273,12 @@ class PlaceObj(nn.Module):
                     scale=params.gift_init_scale
                     ) 
 
+        # BeyondPPA reliability objective (single instance, owned here)
+        self.beyond_ppa_obj = None
+        if getattr(params, 'beyond_ppa_flag', 0):
+            from dreamplace.BeyondPPAObj import BeyondPPAObj
+            self.beyond_ppa_obj = BeyondPPAObj(params, placedb, data_collections)
+
         self.Lgamma_iteration = global_place_params["iteration"]
         if 'Llambda_density_weight_iteration' in global_place_params:
             self.Llambda_density_weight_iteration = global_place_params[
@@ -316,6 +322,13 @@ class PlaceObj(nn.Module):
             result = self.wirelength + self.density_weight.dot(self.density)
         else:
             result = torch.add(self.wirelength, self.density, alpha=(self.density_factor * self.density_weight).item())
+
+        # BeyondPPA human-inspired reliability terms (gated by overflow)
+        if self.beyond_ppa_obj is not None:
+            bppa_cost, self._bppa_raw = self.beyond_ppa_obj(pos)
+            result = result + bppa_cost
+        else:
+            self._bppa_raw = None
 
         return result
 

@@ -305,5 +305,73 @@
 "macro_halo_y": {
     "description": "vertical halo around movable macros",
     "default": 0
+    },
+"beyond_ppa_flag" : {
+    "description" : "enable BeyondPPA human-inspired reliability features for macro placement (MLCAD 2025)",
+    "default" : 0
+    },
+"beyond_ppa_weights" : {
+    "description" : "initial weights [density, io, align, notch] for BeyondPPA feature costs",
+    "default" : [1.0, 1.0, 1.0, 1.0]
+    },
+"beyond_ppa_gate_overflow" : {
+    "description" : "BeyondPPA features activate only once global overflow drops below this threshold",
+    "default" : 0.3
+    },
+"beyond_ppa_ramp_iters" : {
+    "description" : "number of gradient steps over which BeyondPPA cost ramps from 0 to full weight after activation",
+    "default" : 50
+    },
+"beyond_ppa_macro_bins" : {
+    "description" : "coarse grid resolution (NxN) for macro density uniformity measurement",
+    "default" : 32
+    },
+"beyond_ppa_prune_notch" : {
+    "description" : "skip notch penalty for macro pairs whose centre distance exceeds 2x notch_threshold (faster, enable after validation)",
+    "default" : 0
+    },
+"io_keepout_distance" : {
+    "description" : "minimum allowed distance between macro centres and IO port positions, in units of row_height",
+    "default" : 10
+    },
+"grid_alignment_pitch_x" : {
+    "description" : "macro grid alignment pitch in X direction, in units of row_height",
+    "default" : 8
+    },
+"grid_alignment_pitch_y" : {
+    "description" : "macro grid alignment pitch in Y direction, in units of row_height",
+    "default" : 8
+    },
+"notch_threshold" : {
+    "description" : "minimum allowed edge-to-edge gap between adjacent macros, in units of row_height; gaps below this are penalised",
+    "default" : 5
+    },
+"mpc_flag" : {
+    "description" : "enable Model Predictive Control for adaptive BeyondPPA weight scheduling (requires beyond_ppa_flag=1)",
+    "default" : 0
+    },
+"mpc_interval" : {
+    "description" : "number of Llambda iterations between MPC re-planning steps",
+    "default" : 50
+    },
+"mpc_horizon" : {
+    "description" : "MPC prediction horizon H (number of intervals ahead to optimise)",
+    "default" : 5
+    },
+"mpc_history_size" : {
+    "description" : "number of (state, control, next_state) transitions retained for online dynamics fitting",
+    "default" : 200
+    },
+"mpc_ridge" : {
+    "description" : "ridge regularisation coefficient for online linear dynamics fitting (higher = more stable, less adaptive)",
+    "default" : 1e-3
+    },
+"mpc_q_weights" : {
+    "description" : "MPC state cost diagonal Q: [overflow, delta_hpwl_norm, density_raw, io_raw, align_raw, notch_raw]",
+    "default" : [10.0, 1.0, 2.0, 3.0, 3.0, 3.0]
+    },
+"mpc_r_weights" : {
+    "description" : "MPC control cost diagonal R: [dw_log, delta_log_density, delta_log_io, delta_log_align, delta_log_notch]",
+    "default" : [0.1, 0.1, 0.1, 0.1, 0.1]
     }
 }

@@ -36,6 +36,11 @@ class EvalMetrics (object):
         self.tns = None
         self.wns = None
         self.eval_time = None
+        # BeyondPPA reliability metrics (raw, unweighted)
+        self.bppa_density = None
+        self.bppa_io      = None
+        self.bppa_align   = None
+        self.bppa_notch   = None
 
     def __str__(self):
         """
@@ -86,6 +91,10 @@ class EvalMetrics (object):
             content += ", TNS %.6f (1e+5 ps)" % (self.tns)
         if self.wns is not None:
             content += ", WNS %.6f (1e+3 ps)" % (self.wns)
+        if self.bppa_density is not None:
+            content += ", BPPA[dens=%.3E io=%.3E align=%.3E notch=%.3E]" % (
+                self.bppa_density, self.bppa_io,
+                self.bppa_align,   self.bppa_notch)
         if self.eval_time is not None:
             content += ", time %.3fms" % (self.eval_time*1000)
 
@@ -138,4 +147,12 @@ class EvalMetrics (object):
                 pin_utilization_map = ops["pin_utilization"](var)
                 pin_utilization_map_sum = pin_utilization_map.sum()
                 self.pin_utilization = pin_utilization_map.sub_(1).clamp_(min=0).sum() / pin_utilization_map_sum
+            if "beyond_ppa" in ops:
+                # ops["beyond_ppa"] is the BeyondPPAObj instance;
+                # call with no_grad to get raw breakdown without gradient overhead
+                _, raw = ops["beyond_ppa"](var)
+                self.bppa_density = float(raw['density'])
+                self.bppa_io      = float(raw['io'])
+                self.bppa_align   = float(raw['align'])
+                self.bppa_notch   = float(raw['notch'])
         self.eval_time = time.time() - tt

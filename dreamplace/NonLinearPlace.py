@@ -122,6 +122,18 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                     return model
                 density_weight = 0.0
                 model = construct_model()
+                # Anchor density_weight for MPC (review point D)
+                _density_weight_base = float(params.density_weight)
+
+                # MPC controller (initialised once per global placement stage)
+                _mpc = None
+                _mpc_prev_state = None
+                _mpc_current_u  = None   # log-space control vector
+                if getattr(params, 'mpc_flag', 0) and getattr(params, 'beyond_ppa_flag', 0):
+                    import scipy.optimize  # noqa: F401 — validate import early
+                    from dreamplace.MPCController import MPCController
+                    _mpc = MPCController(params)
+                    _mpc_current_u = [0.0] * MPCController.CONTROL_DIM
                 
                 if params.macro_place_flag and cur_stage == 1:
                     density_weight = all_metrics[-1][-1][-1].density_weight.item() / params.two_stage_density_scaler
@@ -254,6 +266,8 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             "goverflow": self.op_collections.density_overflow_op,
                         }
                     )
+                if getattr(params, 'beyond_ppa_flag', 0) and model.beyond_ppa_obj is not None:
+                    eval_ops["beyond_ppa"] = model.beyond_ppa_obj
 
                 # a function to initialize learning rate
                 def initialize_learning_rate(pos):
@@ -707,6 +721,78 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                                 else Lgamma_metrics[-2][-1][-1],
                                 Llambda_flat_iteration,
                             )
+
+                        # ── BeyondPPA gate + MPC weight update ───────────────
+                        cur_llambda_metric = Llambda_metrics[-1][-1]
+                        cur_overflow_scalar = float(
+                            cur_llambda_metric.overflow.mean()
+                            if cur_llambda_metric.overflow is not None else 1.0)
+
+                        # Gate: activate BeyondPPA features when overflow is low enough
+                        if model.beyond_ppa_obj is not None:
+                            model.beyond_ppa_obj.check_and_enable(cur_overflow_scalar)
+
+                        # MPC: re-plan every mpc_interval Llambda iterations
+                        if (_mpc is not None
+                                and model.beyond_ppa_obj is not None
+                                and Llambda_flat_iteration % _mpc.interval == 0):
+                            prev_metric = (
+                                Llambda_metrics[-2][-1]
+                                if len(Llambda_metrics) > 1
+                                else (Lgamma_metrics[-2][-1][-1]
+                                      if len(Lgamma_metrics) > 1 else None))
+                            delta_hpwl_norm = 0.0
+                            if prev_metric is not None and prev_metric.hpwl is not None \
+                                    and cur_llambda_metric.hpwl is not None:
+                                h_cur  = float(cur_llambda_metric.hpwl)
+                                h_prev = float(prev_metric.hpwl)
+                                delta_hpwl_norm = (h_cur - h_prev) / max(h_prev, 1.0)
+
+                            # Build state from raw BeyondPPA metrics (review F)
+                            raw = {}
+                            if cur_llambda_metric.bppa_density is not None:
+                                raw = {
+                                    'density': cur_llambda_metric.bppa_density,
+                                    'io':      cur_llambda_metric.bppa_io,
+                                    'align':   cur_llambda_metric.bppa_align,
+                                    'notch':   cur_llambda_metric.bppa_notch,
+                                }
+                            current_state = [
+                                cur_overflow_scalar,
+                                delta_hpwl_norm,
+                                raw.get('density', 0.0),
+                                raw.get('io',      0.0),
+                                raw.get('align',   0.0),
+                                raw.get('notch',   0.0),
+                            ]
+
+                            if _mpc_prev_state is not None:
+                                _mpc.record(_mpc_prev_state, _mpc_current_u, current_state)
+                                _mpc.fit()
+
+                            _mpc_prev_state = current_state
+                            u_opt = _mpc.step(current_state, _mpc_current_u)
+                            _mpc_current_u = u_opt.tolist()
+
+                            # Apply density-weight delta (anchored, review D)
+                            new_dw = _mpc.apply_density_weight_delta(
+                                _density_weight_base, float(u_opt[0]))
+                            with torch.no_grad():
+                                model.density_weight.fill_(new_dw)
+
+                            # Apply feature weight deltas in log-space (review B)
+                            if model.beyond_ppa_obj is not None:
+                                model.beyond_ppa_obj.update_weights_log(u_opt[1:5])
+
+                            logging.info(
+                                "MPC step iter=%d  u=%s  dw=%.3E  bppa_w=%s"
+                                % (iteration,
+                                   "[%s]" % ", ".join("%.3f" % v for v in u_opt),
+                                   new_dw,
+                                   "[%s]" % ", ".join("%.3f" % w
+                                                      for w in model.beyond_ppa_obj.weights)))
+                        # ─────────────────────────────────────────────────────
+
                         # logging.debug("update density weight %.3f ms" % ((time.time()-t2)*1000))
                         if Llambda_stop_criterion(Lgamma_step, Llambda_density_weight_step, Llambda_metrics):
                             break
