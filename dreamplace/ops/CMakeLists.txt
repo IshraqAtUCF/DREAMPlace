@@ -34,8 +34,13 @@ add_subdirectory(timing)
 if(ENABLE_HETEROSTA)
   add_subdirectory(timing_heterosta)
 endif()
-# gift initial placement 
+# gift initial placement
 add_subdirectory(gift_init)
+# BeyondPPA reliability feature ops (pure Python, no C++ compilation)
+add_subdirectory(io_keepout)
+add_subdirectory(macro_align)
+add_subdirectory(macro_notch)
+add_subdirectory(macro_density)
 
 file(GLOB INSTALL_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/*.py")
 install(
