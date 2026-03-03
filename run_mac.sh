@@ -267,6 +267,7 @@ cmd_install() {
     cmake .. \
       -DCMAKE_INSTALL_PREFIX=${CONTAINER_ROOT}/install \
       -DCMAKE_CXX_ABI=\${TORCH_CXX_ABI} \
+      -DENABLE_HETEROSTA=OFF \
       -DPython_EXECUTABLE=\$(which python3)
 
     echo ''
