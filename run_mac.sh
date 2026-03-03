@@ -7,19 +7,21 @@
 #   ./run_mac.sh <command> [args]
 #
 # COMMANDS
-#   build-image          Build (or rebuild) the Docker image
-#   install              CMake-configure, compile, and install DREAMPlace
-#   reinstall            Clean build artifacts, then install fresh
-#   run <config.json>    Run a full placement from the install directory
-#   shell                Open an interactive shell inside the container
-#   clean                Remove build/ and install/ directories
-#   nuke                 clean + remove the Docker image
-#   status               Show current environment state
-#   help                 Show this message
+#   build-image               Build (or rebuild) the Docker image
+#   install                   CMake-configure, compile, and install DREAMPlace
+#   reinstall                 Clean build artifacts, then install fresh
+#   download-benchmarks       Download ISPD 2005 & 2015 benchmark data
+#   run <config.json>         Run a full placement from the install directory
+#   shell                     Open an interactive shell inside the container
+#   clean                     Remove build/ and install/ directories
+#   nuke                      clean + remove the Docker image
+#   status                    Show current environment state
+#   help                      Show this message
 #
 # TYPICAL FIRST-TIME FLOW
-#   ./run_mac.sh build-image      # ~10-20 min (downloads deps)
-#   ./run_mac.sh install          # ~10-30 min (compiles DREAMPlace CPU-only)
+#   ./run_mac.sh build-image              # ~10-20 min (downloads deps)
+#   ./run_mac.sh install                  # ~10-30 min (compiles DREAMPlace CPU-only)
+#   ./run_mac.sh download-benchmarks      # ~5-30 min (downloads several GB of data)
 #   ./run_mac.sh run test/ispd2005/adaptec1.json
 #
 # REINSTALL FLOW (wipes compiled artifacts, keeps Docker image)
@@ -49,6 +51,14 @@ CONTAINER_ROOT="/DREAMPlace"
 
 # Target platform: Apple M-series runs linux/arm64 natively in Docker Desktop
 PLATFORM="linux/arm64"
+
+# Parallel make jobs.  Each C++ translation unit with PyTorch/pybind11 headers
+# and -O3 -flto consumes 1-2 GB of RAM.  Docker Desktop on Mac defaults to
+# 4-8 GB; compiling with all cores causes OOM kills.  Override by exporting
+# DREAMPLACE_MAKE_JOBS before calling this script, e.g.:
+#   DREAMPLACE_MAKE_JOBS=4 ./run_mac.sh install
+# Tip: give Docker Desktop ≥8 GB in Settings → Resources → Memory first.
+MAKE_JOBS="${DREAMPLACE_MAKE_JOBS:-2}"
 
 # ─── Colors & Logging ─────────────────────────────────────────────────────────
 
@@ -271,8 +281,8 @@ cmd_install() {
       -DPython_EXECUTABLE=\$(which python3)
 
     echo ''
-    echo '==> Compiling (using \$(nproc) cores)...'
-    make -j\$(nproc)
+    echo '==> Compiling (using ${MAKE_JOBS} job(s) — override with DREAMPLACE_MAKE_JOBS=N)...'
+    make -j${MAKE_JOBS}
 
     echo ''
     echo '==> Installing to ${CONTAINER_ROOT}/install ...'
@@ -361,6 +371,39 @@ PYEOF
 
 # ---------------------------------------------------------------------------
 
+cmd_download_benchmarks() {
+  log_section "Downloading ISPD 2005 & 2015 Benchmarks"
+  check_docker
+  ensure_image
+
+  if [[ ! -f "${INSTALL_DIR}/benchmarks/ispd2005_2015.py" ]]; then
+    log_error "Install directory not found or incomplete."
+    log_error "Run './run_mac.sh install' first, then download benchmarks."
+    exit 1
+  fi
+
+  log_info "Benchmarks will be downloaded into: ${INSTALL_DIR}/benchmarks/"
+  log_info "Source: http://www.cerc.utexas.edu/~zixuan/"
+  log_warn "This may take a while (files are several GB compressed)."
+  log_divider
+
+  docker_run bash -c "
+    set -e
+    cd ${CONTAINER_ROOT}/install/benchmarks
+    echo '==> Downloading and extracting ISPD 2005 + 2015 benchmarks...'
+    python3 ispd2005_2015.py
+    echo '==> Download complete.'
+    ls -lh
+  "
+
+  log_divider
+  log_ok "Benchmarks downloaded to: ${INSTALL_DIR}/benchmarks/"
+  log_info "You can now run:"
+  log_info "  ./run_mac.sh run test/ispd2005/adaptec1.json"
+}
+
+# ---------------------------------------------------------------------------
+
 cmd_shell() {
   log_section "Opening Interactive Shell"
   check_docker
@@ -431,20 +474,22 @@ show_help() {
   echo "  ./run_mac.sh <command> [args]"
   echo ""
   echo -e "${C_BOLD}COMMANDS${C_RESET}"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "build-image"         "Build the Docker image (ARM64, CPU-only)"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "build-image --no-cache" "Force a completely fresh image build"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "install"             "CMake + compile + install DREAMPlace"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "reinstall"           "Remove build artifacts, then install fresh"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "run <config.json>"   "Run placement from install directory"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "shell"               "Open interactive shell inside container"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "clean"               "Remove build/ and install/ directories"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "nuke"                "clean + remove the Docker image"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "status"              "Show Docker image and install state"
-  printf "  ${C_CYAN}%-22s${C_RESET} %s\n" "help"                "Show this message"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "build-image"              "Build the Docker image (ARM64, CPU-only)"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "build-image --no-cache"   "Force a completely fresh image build"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "install"                  "CMake + compile + install DREAMPlace"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "reinstall"                "Remove build artifacts, then install fresh"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "download-benchmarks"      "Download ISPD 2005 & 2015 benchmark data"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "run <config.json>"        "Run placement from install directory"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "shell"                    "Open interactive shell inside container"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "clean"                    "Remove build/ and install/ directories"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "nuke"                     "clean + remove the Docker image"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "status"                   "Show Docker image and install state"
+  printf "  ${C_CYAN}%-26s${C_RESET} %s\n" "help"                     "Show this message"
   echo ""
   echo -e "${C_BOLD}FIRST-TIME SETUP${C_RESET}"
-  echo "  ./run_mac.sh build-image          # build Docker image (~10-20 min)"
-  echo "  ./run_mac.sh install              # compile DREAMPlace (~10-30 min)"
+  echo "  ./run_mac.sh build-image              # build Docker image (~10-20 min)"
+  echo "  ./run_mac.sh install                  # compile DREAMPlace (~10-30 min)"
+  echo "  ./run_mac.sh download-benchmarks      # download ISPD data (~5-30 min)"
   echo "  ./run_mac.sh run test/ispd2005/adaptec1.json"
   echo ""
   echo -e "${C_BOLD}REINSTALL (keep Docker image, rebuild DREAMPlace)${C_RESET}"
@@ -471,15 +516,16 @@ main() {
   shift || true
 
   case "${cmd}" in
-    build-image) cmd_build_image "$@" ;;
-    install)     cmd_install     "$@" ;;
-    reinstall)   cmd_reinstall   "$@" ;;
-    run)         cmd_run         "$@" ;;
-    shell)       cmd_shell              ;;
-    clean)       cmd_clean       "$@" ;;
-    nuke)        cmd_nuke        "$@" ;;
-    status)      cmd_status             ;;
-    help|--help|-h) show_help          ;;
+    build-image)          cmd_build_image         "$@" ;;
+    install)              cmd_install             "$@" ;;
+    reinstall)            cmd_reinstall           "$@" ;;
+    download-benchmarks)  cmd_download_benchmarks      ;;
+    run)                  cmd_run                 "$@" ;;
+    shell)                cmd_shell                    ;;
+    clean)                cmd_clean               "$@" ;;
+    nuke)                 cmd_nuke                "$@" ;;
+    status)               cmd_status                   ;;
+    help|--help|-h)       show_help                    ;;
     *)
       log_error "Unknown command: '${cmd}'"
       echo ""
