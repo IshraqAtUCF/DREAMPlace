@@ -134,7 +134,11 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                     from dreamplace.MPCController import MPCController
                     _mpc = MPCController(params)
                     _mpc_current_u = [0.0] * MPCController.CONTROL_DIM
-                
+                elif getattr(params, 'mpc_flag', 0) and not getattr(params, 'beyond_ppa_flag', 0):
+                    logging.warning(
+                        "mpc_flag=1 has no effect when beyond_ppa_flag=0. "
+                        "Set beyond_ppa_flag=1 to enable BeyondPPA+MPC reliability mode.")
+
                 if params.macro_place_flag and cur_stage == 1:
                     density_weight = all_metrics[-1][-1][-1].density_weight.item() / params.two_stage_density_scaler
                     # at the 2nd stage, total_movable_node_area should exclude movable macro area to enable more aggresive spreading of cells

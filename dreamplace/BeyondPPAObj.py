@@ -139,11 +139,10 @@ class BeyondPPAObj(nn.Module):
             Each increment is clipped to ±MAX_DELTA and blended via EMA.
         """
         MAX_DELTA = 0.095   # ≈ ±10 % change per call in natural-log scale
-        EMA_ALPHA = 0.20    # weight for the new value (keeps history at 80 %)
+        EMA_ALPHA = 0.20    # blend factor (80 % history, 20 % new signal)
         for i, d in enumerate(delta_log):
             d_clipped = max(-MAX_DELTA, min(MAX_DELTA, float(d)))
-            self._log_w[i] = ((1.0 - EMA_ALPHA) * self._log_w[i]
-                              + EMA_ALPHA * (self._log_w[i] + d_clipped))
+            self._log_w[i] += EMA_ALPHA * d_clipped
 
     def check_and_enable(self, overflow):
         """
