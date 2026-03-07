@@ -789,6 +789,7 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             # apply_density_weight_delta(base, 0.0) = base,
                             # which resets the learned density weight back to the
                             # initial value every mpc_interval iterations.
+                            new_dw = float(model.density_weight)
                             if _mpc._model_fitted:
                                 new_dw = _mpc.apply_density_weight_delta(
                                     _density_weight_base, float(u_opt[0]))
