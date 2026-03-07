@@ -783,11 +783,17 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             u_opt = _mpc.step(current_state, _mpc_current_u)
                             _mpc_current_u = u_opt.tolist()
 
-                            # Apply density-weight delta (anchored, review D)
-                            new_dw = _mpc.apply_density_weight_delta(
-                                _density_weight_base, float(u_opt[0]))
-                            with torch.no_grad():
-                                model.density_weight.fill_(new_dw)
+                            # Apply density-weight delta only when model is fitted.
+                            # Without this guard, step() returns zeros when the
+                            # model has not been fitted yet, causing
+                            # apply_density_weight_delta(base, 0.0) = base,
+                            # which resets the learned density weight back to the
+                            # initial value every mpc_interval iterations.
+                            if _mpc._model_fitted:
+                                new_dw = _mpc.apply_density_weight_delta(
+                                    _density_weight_base, float(u_opt[0]))
+                                with torch.no_grad():
+                                    model.density_weight.fill_(new_dw)
 
                             # Apply feature weight deltas in log-space (review B)
                             if model.beyond_ppa_obj is not None:
