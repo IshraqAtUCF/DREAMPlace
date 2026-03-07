@@ -330,6 +330,10 @@
     "description" : "skip notch penalty for macro pairs whose centre distance exceeds 2x notch_threshold (faster, enable after validation)",
     "default" : 0
     },
+"beyond_ppa_force_fraction" : {
+    "description" : "force-enable BeyondPPA in the last (1 - this value) fraction of Lgamma iterations if not already activated by the overflow gate; 0.8 activates at 80% of total iterations regardless of overflow",
+    "default" : 0.8
+    },
 "io_keepout_distance" : {
     "description" : "minimum allowed distance between macro centres and IO port positions, in units of row_height",
     "default" : 10

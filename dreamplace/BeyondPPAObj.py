@@ -144,22 +144,32 @@ class BeyondPPAObj(nn.Module):
             d_clipped = max(-MAX_DELTA, min(MAX_DELTA, float(d)))
             self._log_w[i] += EMA_ALPHA * d_clipped
 
-    def check_and_enable(self, overflow):
+    def check_and_enable(self, overflow, force=False):
         """
-        Activate BeyondPPA costs once overflow drops below the gate threshold.
+        Activate BeyondPPA costs once overflow drops below the gate threshold,
+        or when force=True (e.g. time-based trigger from the last N% of iterations).
 
         Parameters
         ----------
         overflow : float  (scalar overflow value, 0..1)
+        force : bool
+            If True, activate regardless of overflow level.
         """
         if self.enabled:
             return
-        if float(overflow) < self.gate_overflow:
+        overflow_trigger = float(overflow) < self.gate_overflow
+        if overflow_trigger or force:
             self.enabled = True
             self._ramp_step = 0
-            logging.info(
-                "BeyondPPAObj: activated (overflow=%.4f < gate=%.4f)"
-                % (float(overflow), self.gate_overflow))
+            if force and not overflow_trigger:
+                logging.info(
+                    "BeyondPPAObj: force-activated at iteration threshold "
+                    "(overflow=%.4f >= gate=%.4f)"
+                    % (float(overflow), self.gate_overflow))
+            else:
+                logging.info(
+                    "BeyondPPAObj: activated (overflow=%.4f < gate=%.4f)"
+                    % (float(overflow), self.gate_overflow))
 
     def _ramp_scale(self):
         """Linear ramp 0 → 1 over ramp_iters calls after activation."""

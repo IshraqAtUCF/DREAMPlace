@@ -158,14 +158,26 @@ d_ij        = dx_gap + dy_gap    (Manhattan edge-to-edge gap)
 Loss        = Σ_{i < j}  ReLU(d_thresh − d_ij)²
 ```
 
-### 4.3 Overflow gating and linear ramp
+### 4.3 Gating, force-trigger, and linear ramp
 
-BeyondPPA terms are **inactive** until:
+BeyondPPA terms are **inactive** until one of two triggers fires (whichever comes first):
+
+**Trigger A — Overflow gate:**
 ```
 current_overflow  <  beyond_ppa_gate_overflow  (default 0.20)
 ```
 
-After activation, a linear ramp prevents a sudden objective shock:
+**Trigger B — Time-based force trigger:**
+```
+Lgamma_step  >=  beyond_ppa_force_fraction × Lgamma_iteration
+               (default: 0.8 × total_iterations, i.e. last 20%)
+```
+
+This guarantees BeyondPPA features **always** contribute to the final phase of
+placement even when the optimizer cannot achieve the overflow threshold (e.g. the
+observed overflow of 0.423 at iteration 999 with `gate=0.20`).
+
+After activation (by either trigger), a linear ramp prevents a sudden objective shock:
 ```
 ramp(t) = min(1,  (t − t_activate) / ramp_iters)
 ```
@@ -686,11 +698,13 @@ MAX_DELTA  = 0.095   # in update_weights_log()
 
 **Key methods:**
 
-`check_and_enable(overflow)` — call once per Llambda iteration:
+`check_and_enable(overflow, force=False)` — call once per Llambda iteration:
 ```python
-if not self.enabled and overflow < self.gate_overflow:
+overflow_trigger = float(overflow) < self.gate_overflow
+if overflow_trigger or force:
     self.enabled = True
     self._ramp_step = 0
+    # logs "activated" (overflow gate) or "force-activated" (time gate)
 ```
 
 `_ramp_scale()` — returns linear ramp 0→1 over `ramp_iters` steps after enable.
@@ -849,9 +863,12 @@ weight update):
 cur_llambda_metric = Llambda_metrics[-1][-1]
 cur_overflow_scalar = float(cur_llambda_metric.overflow.mean() ...)
 
-# Gate: activate BeyondPPA features when overflow is low enough
+# Gate: activate BeyondPPA via overflow threshold OR time-based force trigger
 if model.beyond_ppa_obj is not None:
-    model.beyond_ppa_obj.check_and_enable(cur_overflow_scalar)
+    _force_frac = float(getattr(params, 'beyond_ppa_force_fraction', 0.8))
+    _force_bppa = (model.Lgamma_iteration > 0
+                   and Lgamma_step >= _force_frac * model.Lgamma_iteration)
+    model.beyond_ppa_obj.check_and_enable(cur_overflow_scalar, force=_force_bppa)
 
 # MPC: re-plan every mpc_interval Llambda iterations
 if (_mpc is not None
@@ -1024,6 +1041,7 @@ to be backwards-compatible with configs that don't mention them.
 | `beyond_ppa_ramp_iters` | int | `50` | Gradient steps to ramp from 0→1 after activation |
 | `beyond_ppa_macro_bins` | int | `32` | Coarse grid size (N×N) for density measurement |
 | `beyond_ppa_prune_notch` | int (0/1) | `0` | Enable notch pair pre-filter (disabled by default) |
+| `beyond_ppa_force_fraction` | float | `0.8` | Force-enable at this fraction of Lgamma iterations (last 20% by default) |
 | `io_keepout_distance` | float | `10` | Keepout radius from IO ports, in units of `row_height` |
 | `grid_alignment_pitch_x` | float | `8` | Grid pitch X, in units of `row_height` |
 | `grid_alignment_pitch_y` | float | `8` | Grid pitch Y, in units of `row_height` |
@@ -1111,8 +1129,9 @@ Llambda iteration:
   → density_weight update (DREAMPlace default logic)
 
   → BeyondPPA gate check:
-      → beyond_ppa_obj.check_and_enable(overflow_scalar)
-      → if newly enabled: logs "BeyondPPAObj: activated (overflow=…)"
+      → _force_bppa = (Lgamma_step >= force_fraction × Lgamma_iteration)
+      → beyond_ppa_obj.check_and_enable(overflow_scalar, force=_force_bppa)
+      → if newly enabled: logs "activated (overflow=…)" or "force-activated …"
 
   → MPC step (if Llambda_flat_iteration % mpc_interval == 0):
       → build current_state from overflow, Δhpwl, bppa_*
