@@ -1,307 +1,380 @@
-# DREAMPlace + BeyondPPA + MPC: Complete Implementation Reference
+# DREAMPlace + BeyondPPA + MPC — Complete Implementation Reference
 
-> **Audience:** Any developer or AI agent picking up this project cold.
-> This document is fully self-contained — read it cover-to-cover and you will understand the full design, every file's role, how to build the system, and how to run experiments.
+> **Who this is for:**
+> Any developer, researcher, or AI agent picking up this project cold.
+> Read cover-to-cover and you will understand the full problem, the design, every
+> file's role, the mathematical formulation, how to build the system from scratch,
+> and how to run both operational modes.
+> **No additional context is required.**
 
 ---
 
 ## Table of Contents
 
-1. [Why This Exists](#1-why-this-exists)
-2. [What Was Built](#2-what-was-built)
-3. [Architecture](#3-architecture)
-4. [Repository Structure](#4-repository-structure)
-5. [Build & Installation](#5-build--installation)
-6. [Running Experiments (Two Modes)](#6-running-experiments-two-modes)
-7. [Implementation Reference — New Files](#7-implementation-reference--new-files)
-8. [Implementation Reference — Modified Files](#8-implementation-reference--modified-files)
-9. [Parameters Reference](#9-parameters-reference)
-10. [Expected Output & Verification](#10-expected-output--verification)
-11. [Design Decisions & Trade-offs](#11-design-decisions--trade-offs)
-12. [Known Limitations & Future Work](#12-known-limitations--future-work)
+1. [What This Project Is](#1-what-this-project-is)
+2. [The Problem Being Solved](#2-the-problem-being-solved)
+3. [Two Operational Modes (and nothing in between)](#3-two-operational-modes-and-nothing-in-between)
+4. [Mathematical Formulation](#4-mathematical-formulation)
+5. [Architecture Overview](#5-architecture-overview)
+6. [Repository Structure](#6-repository-structure)
+7. [Build & Installation (macOS Apple Silicon)](#7-build--installation-macos-apple-silicon)
+8. [Running Experiments](#8-running-experiments)
+9. [Implementation Reference — New Files](#9-implementation-reference--new-files)
+10. [Implementation Reference — Modified Files](#10-implementation-reference--modified-files)
+11. [Build System Details](#11-build-system-details)
+12. [Parameters Reference](#12-parameters-reference)
+13. [Data Flow Walkthrough](#13-data-flow-walkthrough)
+14. [Expected Output & Verification](#14-expected-output--verification)
+15. [Design Decisions & Trade-offs](#15-design-decisions--trade-offs)
+16. [Known Limitations & Future Work](#16-known-limitations--future-work)
 
 ---
 
-## 1. Why This Exists
+## 1. What This Project Is
 
-### The Problem
+**DREAMPlace** is an open-source, GPU-accelerated VLSI placement tool built on
+PyTorch. It treats chip placement as a differentiable optimisation problem and
+uses gradient descent (specifically Nesterov acceleration) to minimise a
+placement objective.
 
-DREAMPlace's default global-placement objective is:
+This project adds the **BeyondPPA + MPC** integration on top of DREAMPlace:
 
-```
-J = Σ HPWL(net_i)  +  λ · Σ DensityPenalty(bin_j)
-```
+- **BeyondPPA** (MLCAD 2025 paper): four differentiable reliability-penalty terms
+  that discourage placement patterns known to cause post-route manufacturing and
+  reliability defects.
+- **MPC** (Model Predictive Control): an online receding-horizon controller that
+  adaptively schedules the penalty weights *during* placement, so the solver
+  balances reliability penalties against wirelength and density automatically.
 
-This objective drives cells toward legal positions with short wires, but it leaves four classes of **post-route reliability defects** unaddressed:
-
-| Defect | Post-Route Consequence |
-|--------|----------------------|
-| Uneven macro density | IR-drop hotspots, localised thermal stress |
-| Macros near IO ports | Signal integrity violations, noise coupling |
-| Unaligned macros | Clock-tree synthesis difficulty, clock skew |
-| Narrow inter-macro gaps (notches) | EM violations, routing congestion |
-
-### The Solution
-
-Inspired by *BeyondPPA: Human-Inspired Reinforcement Learning for Post-Route Reliability-Aware Macro Placement* (MLCAD 2025), we add **four differentiable reliability penalty terms** directly into DREAMPlace's objective. Nesterov gradient descent then optimises all five terms simultaneously — no separate RL training required.
-
-On top of that, a **Model Predictive Control (MPC) layer** adaptively tunes the five feature weights online during each placement run. It fits a linear dynamics model from observed (state, weight-vector, next-state) transitions and solves a receding-horizon optimisation problem every 50 Llambda iterations to find the best weight sequence. This replaces hand-tuned static λ values entirely.
-
-### Why Better Than the Paper
-
-The paper's DQN agent requires offline pre-training on historical placements. Our approach:
-- No offline training — MPC model is fit online from data collected during the *current* run
-- Fully differentiable — gradient descent can co-optimise all terms simultaneously
-- Adapts online to each design's specific macro configuration and density profile
+This is **research code** — the primary benchmark is ISPD 2005 `adaptec1`.
 
 ---
 
-## 2. What Was Built
+## 2. The Problem Being Solved
 
-### Two Operational Modes
-
-| Mode | Description | Config File |
-|------|-------------|-------------|
-| **Baseline** | Standard DREAMPlace (wirelength + density only) | `test/ispd2005/adaptec1.json` |
-| **BeyondPPA + MPC** | Reliability-aware macro placement with adaptive weight control | `test/ispd2005/adaptec1_mpc.json` |
-
-There is intentionally no "BeyondPPA without MPC" mode — MPC is lightweight enough to always run alongside BeyondPPA.
-
-### New Components
+### DREAMPlace's default objective
 
 ```
-dreamplace/BeyondPPAObj.py          Combined reliability objective module
-dreamplace/MPCController.py         Online adaptive weight controller
-dreamplace/ops/macro_density/       Density uniformity penalty op
-dreamplace/ops/io_keepout/          IO keepout zone penalty op
-dreamplace/ops/macro_align/         Grid alignment penalty op
-dreamplace/ops/macro_notch/         Notch gap penalty op
-test/ispd2005/adaptec1_mpc.json     Reference BeyondPPA+MPC config
+J = Σ_net HPWL(net)  +  λ · Σ_bin DensityPenalty(bin)
 ```
 
-### Modified Components
+This minimises half-perimeter wirelength (HPWL) while spreading cells to avoid
+density overflow. It produces legal, compact placements — but it leaves four
+classes of **post-route reliability defects** unaddressed:
 
-```
-dreamplace/EvalMetrics.py           + bppa_density/io/align/notch metric fields
-dreamplace/PlaceObj.py              + BeyondPPAObj init + obj_fn extension
-dreamplace/NonLinearPlace.py        + MPC init, gate check, re-plan block
-dreamplace/params.json              + 17 new parameters
-dreamplace/ops/CMakeLists.txt       + 4 new add_subdirectory entries
-```
+| # | Defect | Post-Route Consequence |
+|---|--------|----------------------|
+| 1 | Uneven macro density | IR-drop hotspots, localised thermal stress |
+| 2 | Macros near IO ports | Signal integrity violations, noise coupling |
+| 3 | Unaligned macros | Clock-tree synthesis difficulty, clock skew |
+| 4 | Narrow gaps between macros (notches) | EM risk, routing congestion |
+
+### The BeyondPPA fix
+
+Add four differentiable penalty terms — one per defect class — to the objective.
+Each term provides gradients that push macros toward safer positions *while*
+gradient descent is running, so no separate post-processing step is needed.
+
+### The MPC problem
+
+Naively fixing the penalty weights leads to either:
+- weights too small → penalties ignored, defects persist
+- weights too large → wirelength degrades, overflow stalls
+
+MPC solves this by treating the placement loop as a dynamical system and
+adaptively tuning all penalty weights (and the density weight) at runtime to
+track a target overflow trajectory while suppressing reliability metrics.
 
 ---
 
-## 3. Architecture
+## 3. Two Operational Modes (and nothing in between)
 
-### Component Diagram
+The project deliberately exposes exactly **two modes**:
 
-```
-DREAMPlace Main Loop (NonLinearPlace.__call__)
-│
-├── Lgamma loop  ← reduces gamma (smoothing) over iterations
-│   └── Llambda loop  ← updates density_weight between steps
-│       └── Lsub loop  ← single Nesterov descent step
-│
-│   After each Lsub step:
-│   ┌────────────────────────────────────────────────┐
-│   │  PlaceObj.obj_fn(pos)                          │
-│   │    wirelength  = op_collections.wirelength(pos)│
-│   │    density     = op_collections.density(pos)   │
-│   │    bppa_cost,  = BeyondPPAObj.forward(pos)     │
-│   │    return WL + λ·density + bppa_cost           │
-│   └────────────────────────────────────────────────┘
-│
-│   After each Llambda step:
-│   ┌──────────────────────────────────────────────────────────┐
-│   │  BeyondPPAObj.check_and_enable(overflow)                 │
-│   │    → activate when overflow < gate_overflow (0.20)       │
-│   │    → ramp weight 0→1 over ramp_iters (50) gradient steps │
-│   │                                                           │
-│   │  if Llambda_flat_iteration % mpc_interval == 0:          │
-│   │    state = [overflow, Δhpwl, density_raw, io, align, notch] │
-│   │    MPCController.record(prev_state, prev_u, state)       │
-│   │    MPCController.fit()   ← ridge regression              │
-│   │    u_opt = MPCController.step(state, current_u)          │
-│   │    density_weight *= exp(u_opt[0])     (anchored)        │
-│   │    BeyondPPAObj.update_weights_log(u_opt[1:5])           │
-│   └──────────────────────────────────────────────────────────┘
-```
+| Mode | Config flag | What runs |
+|------|------------|-----------|
+| **Baseline** | `beyond_ppa_flag=0` | Stock DREAMPlace (HPWL + density) |
+| **BeyondPPA + MPC** | `beyond_ppa_flag=1`, `mpc_flag=1` | DREAMPlace + all 4 reliability penalties + adaptive MPC weight scheduling |
 
-### Data Flow: pos Tensor → Gradient
+There is **no intermediate** "BeyondPPA without MPC" config file.
+Setting `mpc_flag=1` while `beyond_ppa_flag=0` is a **configuration error** and
+prints a warning:
 
 ```
-pos  [2 × num_physical_nodes]
-  x: pos[0 : num_physical_nodes]
-  y: pos[num_physical_nodes : 2*num_physical_nodes]
-
-  Macro slice (in each op):
-    x_macro = pos[:num_movable][macro_mask]      # movable macros only
-    y_macro = pos[num_phys:num_phys+num_movable][macro_mask]
-
-BeyondPPAObj.forward(pos)
-  ↓
-  MacroDensityUniformityOp(pos) → scalar (density variance)
-  IOKeepoutOp(pos)              → scalar (keepout violation)
-  MacroGridAlignOp(pos)         → scalar (alignment error)
-  MacroNotchOp(pos)             → scalar (notch penalty)
-  ↓
-  total = ramp × (w0·dens + w1·io + w2·align + w3·notch)
-  raw   = {k: v.detach()}   ← MPC observes raw unweighted costs
-  return total, raw
-
-PlaceObj.obj_fn(pos)
-  ↓
-  result = WL + λ·density + total
-  ↓
-  result.backward()   ← gradient flows through all 4 ops to pos
-```
-
-### MPC Data Flow
-
-```
-Iteration k (every 50 Llambda steps):
-  state_k  = [overflow, Δhpwl_norm, density_raw, io_raw, align_raw, notch_raw]
-  control_k = [dw_log, Δlog_density, Δlog_io, Δlog_align, Δlog_notch]
-
-  MPCController.record(state_{k-1}, control_{k-1}, state_k)
-  MPCController.fit():
-    X = [[s_{t}; u_{t}; 1] for t in history]   # [N, S+C+1]
-    Y = [s_{t+1} for t in history]              # [N, S]
-    θ = (X^T X + λI)^{-1} X^T Y               # ridge regression
-    A = θ[:S, :].T   B = θ[S:S+C, :].T   c = θ[-1, :]
-
-  MPCController.step(state_k, control_k):
-    min_{U∈R^{H×C}}  Σ_{i=0}^{H} (s_i - s_ref)^T Q (s_i - s_ref) + u_i^T R u_i
-    s.t.  u_i ∈ [-MAX_DELTA, +MAX_DELTA]^C
-    via scipy.optimize.minimize(..., method='SLSQP')
-    return U[0]   ← first action of optimal sequence
-
-  Apply control:
-    density_weight ← base_dw × exp(clip(offset + u[0], ±log(10)))
-    BeyondPPAObj weights ← exp(log_w + EMA_ALPHA × clip(u[1:5], ±MAX_DELTA))
+WARNING: mpc_flag=1 has no effect when beyond_ppa_flag=0.
+         Set beyond_ppa_flag=1 to enable BeyondPPA+MPC reliability mode.
 ```
 
 ---
 
-## 4. Repository Structure
+## 4. Mathematical Formulation
+
+### 4.1 Global placement objective
+
+```
+J(pos) = HPWL(pos)
+       + λ_density · DensityPenalty(pos)
+       + ramp(t) · [
+           λ_d · MacroDensityUniformity(pos)   -- IR-drop
+         + λ_io · IOKeepout(pos)                -- noise coupling
+         + λ_a · MacroGridAlign(pos)            -- clock-tree
+         + λ_n · MacroNotch(pos)                -- EM / congestion
+         ]
+```
+
+where `pos` is the flat tensor `[x_0..x_N, y_0..y_N]` for all physical nodes.
+
+### 4.2 Penalty term definitions
+
+**MacroDensityUniformity** — variance of macro area density over a coarse grid:
+
+```
+grid[b] = Σ_i  bilinear_weight(macro_i, bin_b) × area_i / bin_area
+Loss     = Var(grid)
+```
+
+Bilinear scatter makes the gradient smooth (no hard bin boundaries).
+
+**IOKeepout** — ReLU² penalty for macros inside the keepout radius:
+
+```
+Loss = Σ_{i ∈ macros, j ∈ IO_ports}  ReLU(d_keepout − ‖center_i − pos_j‖)²
+```
+
+**MacroGridAlign** — periodic sin² potential pulling macros toward grid anchors:
+
+```
+Loss = Σ_{i ∈ macros}  [ sin²(π·x_i / pitch_x) + sin²(π·y_i / pitch_y) ]
+```
+
+Energy is exactly 0 at grid multiples, maximal halfway between.
+
+**MacroNotch** — ReLU² penalty for narrow inter-macro gaps:
+
+```
+dx_gap(i,j) = max(0,  |cx_i − cx_j| − (w_i + w_j)/2 )
+dy_gap(i,j) = max(0,  |cy_i − cy_j| − (h_i + h_j)/2 )
+d_ij        = dx_gap + dy_gap    (Manhattan edge-to-edge gap)
+Loss        = Σ_{i < j}  ReLU(d_thresh − d_ij)²
+```
+
+### 4.3 Overflow gating and linear ramp
+
+BeyondPPA terms are **inactive** until:
+```
+current_overflow  <  beyond_ppa_gate_overflow  (default 0.20)
+```
+
+After activation, a linear ramp prevents a sudden objective shock:
+```
+ramp(t) = min(1,  (t − t_activate) / ramp_iters)
+```
+
+### 4.4 Log-space weight representation
+
+All feature weights are stored in log-space:
+```
+log_w = [log(λ_d), log(λ_io), log(λ_a), log(λ_n)]
+actual weight λ_i = exp(log_w[i])
+```
+
+MPC emits log-space increments `Δlog(λ)`. Weight update:
+```
+log_w[i]  +=  EMA_ALPHA × clip(Δlog_w[i], −MAX_DELTA, +MAX_DELTA)
+
+EMA_ALPHA = 0.20   (80% history, 20% new signal)
+MAX_DELTA = 0.095  (≈ ±10% change per call in natural-log scale)
+```
+
+### 4.5 MPC formulation
+
+**State** `s ∈ ℝ⁶`:
+```
+s = [overflow,  Δhpwl_norm,  density_raw,  io_raw,  align_raw,  notch_raw]
+```
+
+**Control** `u ∈ ℝ⁵` (all log-space increments):
+```
+u = [Δlog(λ_density_weight),  Δlog(λ_d),  Δlog(λ_io),  Δlog(λ_a),  Δlog(λ_n)]
+```
+
+**Linear dynamics** (fitted online by ridge regression):
+```
+s_{t+1} ≈ A · s_t  +  B · u_t  +  c
+```
+
+**Receding-horizon cost** over H steps:
+```
+min_{u_0..u_{H-1}}  Σ_{k=0}^{H-1}  [ (s_k − s_ref)ᵀ Q (s_k − s_ref)
+                                      +  u_kᵀ R u_k ]
+```
+
+Reference: `s_ref = [stop_overflow, 0, 0, 0, 0, 0]`
+Solved by `scipy.optimize.minimize` with SLSQP and box constraints.
+
+**Density-weight anchor** (prevents runaway):
+```
+dw_log_offset  =  clip(dw_log_offset + Δlog(λ_dw),  −log(10),  +log(10))
+density_weight  =  density_weight_base × exp(dw_log_offset)
+```
+
+The base is recorded once at placement start; the offset is bounded to ±10×.
+
+---
+
+## 5. Architecture Overview
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│  DREAMPlace Global Placement Loop  (NonLinearPlace.py)                │
+│                                                                       │
+│  ┌─ Lgamma loop (gamma reduction) ───────────────────────────────┐   │
+│  │  ┌─ Llambda loop (density weight update) ──────────────────┐  │   │
+│  │  │  ┌─ Lsub loop (Nesterov gradient step) ──────────────┐  │  │   │
+│  │  │  │                                                    │  │  │   │
+│  │  │  │  pos  ──►  PlaceObj.obj_fn()  ──►  loss           │  │  │   │
+│  │  │  │                 │                                  │  │  │   │
+│  │  │  │          ┌──────┴──────┐                           │  │  │   │
+│  │  │  │          │             │                           │  │  │   │
+│  │  │  │     HPWL + λ·Density  BeyondPPAObj.forward()      │  │  │   │
+│  │  │  │                       (4 ops, gated+ramped)        │  │  │   │
+│  │  │  │                                                    │  │  │   │
+│  │  │  └────────────────────────────────────────────────────┘  │  │   │
+│  │  │                                                           │  │   │
+│  │  │  Every mpc_interval Llambda steps:                        │  │   │
+│  │  │    MPCController.record() → .fit() → .step()             │  │   │
+│  │  │    → update density_weight + update BeyondPPA log_w      │  │   │
+│  │  │                                                           │  │   │
+│  │  └───────────────────────────────────────────────────────────┘  │   │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**Placement data layout** (`pos` tensor):
+```
+pos = [x_0 .. x_{N_mov-1}, x_{N_mov} .. x_{N_phys-1}, | y_0 .. y_{N_phys-1}]
+       ← movable nodes →     ← fixed terminals →     ← y section, same layout →
+
+N_mov  = num_movable_nodes   (cells + macros that the optimizer moves)
+N_phys = num_physical_nodes  (N_mov + fixed IO terminals; excludes fillers)
+```
+
+**Macro detection** (DREAMPlace PlaceDB heuristic, not new code):
+```python
+movable_macro_mask[i] = True
+    if node_area[i] > 10 × mean_cell_area
+   AND node_size_y[i] > 2 × row_height
+```
+
+---
+
+## 6. Repository Structure
 
 ```
 DREAMPlace/
-├── Dockerfile.mac                  ARM64 Linux Docker image (Apple Silicon)
-├── run_mac.sh                      All commands: build, install, run (macOS)
-├── PLAN.md                         THIS FILE — complete implementation reference
+├── run_mac.sh                    ← ENTRY POINT for all build/run operations
+├── Dockerfile.mac                ← ARM64 Ubuntu 22.04 container spec
+├── PLAN.md                       ← THIS FILE
 │
-├── dreamplace/                     Core DREAMPlace Python package
-│   ├── Placer.py                   Entry point: loads params, calls NonLinearPlace
-│   ├── BasicPlace.py               Base class: builds all op collections
-│   ├── NonLinearPlace.py           Main optimization loop (3 nested loops)
-│   ├── PlaceObj.py                 Differentiable objective function
-│   ├── PlaceDB.py                  Placement database (nodes, nets, geometry)
-│   ├── EvalMetrics.py              Metrics at each step (wirelength, overflow, BPPA)
-│   ├── Params.py                   Loads params.json defaults + user JSON overrides
-│   ├── params.json                 Parameter schema with defaults
+├── dreamplace/
+│   ├── Placer.py                 ← top-level entry: loads params, calls NonLinearPlace
+│   ├── Params.py                 ← parameter loader (reads params.json schema)
+│   ├── params.json               ← parameter schema + defaults (17 new params added)
+│   ├── BasicPlace.py             ← base class: data loading, legalization, I/O
+│   ├── NonLinearPlace.py         ← MODIFIED: three-loop optimizer + MPC integration
+│   ├── PlaceObj.py               ← MODIFIED: objective function (adds BeyondPPA)
+│   ├── EvalMetrics.py            ← MODIFIED: adds bppa_* metric fields + logging
+│   ├── BeyondPPAObj.py           ← NEW: combined reliability objective module
+│   ├── MPCController.py          ← NEW: online MPC weight scheduler
 │   │
-│   ├── BeyondPPAObj.py             [NEW] Combined reliability objective module
-│   ├── MPCController.py            [NEW] Online MPC weight scheduler
-│   │
-│   └── ops/                        All placement operators (nn.Module subclasses)
-│       ├── CMakeLists.txt          Registers all op subdirs for install
-│       ├── macro_density/          [NEW] Density uniformity penalty
-│       │   ├── __init__.py
-│       │   ├── macro_density.py
-│       │   └── CMakeLists.txt
-│       ├── io_keepout/             [NEW] IO keepout zone penalty
-│       │   ├── __init__.py
-│       │   ├── io_keepout.py
-│       │   └── CMakeLists.txt
-│       ├── macro_align/            [NEW] Grid alignment penalty
-│       │   ├── __init__.py
-│       │   ├── macro_align.py
-│       │   └── CMakeLists.txt
-│       ├── macro_notch/            [NEW] Notch gap penalty
-│       │   ├── __init__.py
-│       │   ├── macro_notch.py
-│       │   └── CMakeLists.txt
-│       └── [28 existing C++/CUDA ops: electric_potential, hpwl, etc.]
+│   └── ops/
+│       ├── CMakeLists.txt        ← MODIFIED: registers 4 new subdirectories
+│       ├── macro_density/
+│       │   ├── macro_density.py  ← NEW: MacroDensityUniformityOp
+│       │   └── CMakeLists.txt    ← NEW: pure-Python install (no C++ compilation)
+│       ├── io_keepout/
+│       │   ├── io_keepout.py     ← NEW: IOKeepoutOp
+│       │   └── CMakeLists.txt    ← NEW
+│       ├── macro_align/
+│       │   ├── macro_align.py    ← NEW: MacroGridAlignOp
+│       │   └── CMakeLists.txt    ← NEW
+│       └── macro_notch/
+│           ├── macro_notch.py    ← NEW: MacroNotchOp
+│           └── CMakeLists.txt    ← NEW
 │
 └── test/
     └── ispd2005/
-        ├── adaptec1.json           Baseline config (no BeyondPPA/MPC)
-        ├── adaptec1_mpc.json       [NEW] BeyondPPA+MPC config
-        └── [other benchmark configs]
+        ├── adaptec1.json         ← baseline mode config (existing)
+        └── adaptec1_mpc.json     ← BeyondPPA+MPC mode config (NEW)
 ```
 
 ---
 
-## 5. Build & Installation
+## 7. Build & Installation (macOS Apple Silicon)
 
-### Platform
-
-All commands below use `run_mac.sh`, which runs DREAMPlace inside a Docker container. This script was written for **Apple Silicon macOS** (M1/M2/M3/M4) but works on any machine with Docker Desktop.
-
-- **Architecture:** `linux/arm64` (ARM64 emulation for Intel Macs; native on Apple Silicon)
-- **GPU:** CPU-only. CUDA/NVIDIA GPU not supported on Apple Silicon; all placement uses OpenMP multi-threading.
-- **Docker:** Required. Get Docker Desktop: https://www.docker.com/products/docker-desktop/
-
-### Environment Details (from Dockerfile.mac)
-
-| Component | Version |
-|-----------|---------|
-| Base OS | Ubuntu 22.04 (ARM64) |
-| GCC | 11 (from Ubuntu 22.04 repos) |
-| CMake | 3.22 (from Ubuntu 22.04 repos) |
-| Python | 3.10 (Ubuntu 22.04 default) |
-| PyTorch | Latest CPU-only (linux_aarch64) |
-| Boost | 1.74 |
-| Bison | 3.8 |
-| SciPy | ≥1.1.0 |
-| NumPy | ≥1.15.4 |
+All build operations go through `./run_mac.sh`. **Never run cmake or make
+directly** — the script handles Docker, submodule checks, ABI detection, and
+GPU-override automatically.
 
 ### Prerequisites
 
-```bash
-# 1. Install Docker Desktop
-# https://www.docker.com/products/docker-desktop/
-# Start Docker Desktop and ensure it is running
+- **Docker Desktop** for Mac with Apple Silicon support (≥4.x recommended)
+- Allocate **≥8 GB RAM** to Docker Desktop in Settings → Resources → Memory
+- A clone of this repo with git history (not a ZIP download):
+  ```bash
+  git clone --recursive https://github.com/<your-fork>/DREAMPlace.git
+  ```
 
-# 2. Clone the repository WITH submodules
-git clone --recursive https://github.com/IshraqAtUCF/DREAMPlace.git
-cd DREAMPlace
-
-# 3. If you already cloned without --recursive:
-git submodule update --init --recursive
-```
-
-### First-Time Setup (Run in Order)
+### First-time setup (three commands)
 
 ```bash
-# Step 1: Build the Docker image (one-time, ~10-20 min)
-# Downloads Ubuntu packages + PyTorch CPU wheel + Python dependencies
+# 1. Build the Docker image  (~10-20 min, downloads Ubuntu 22.04 + PyTorch)
 ./run_mac.sh build-image
 
-# Step 2: Compile and install DREAMPlace (one-time, ~10-30 min)
-# Runs CMake inside the container, compiles ~28 C++ ops, installs to ./install/
+# 2. Compile and install DREAMPlace  (~10-30 min)
+#    Uses MAKE_JOBS=2 by default to avoid OOM.
+#    Override: DREAMPLACE_MAKE_JOBS=4 ./run_mac.sh install
 ./run_mac.sh install
 
-# Step 3: Download benchmark data (~5-30 min, several GB)
-# Downloads ISPD 2005 and 2015 benchmark circuits into ./install/benchmarks/
+# 3. Download benchmark data  (~5-30 min, several GB)
 ./run_mac.sh download-benchmarks
 ```
 
-**Memory note:** Each C++ translation unit with PyTorch/pybind11 headers consumes 1-2 GB RAM during compilation. The default is `MAKE_JOBS=2` to avoid OOM. If Docker Desktop has ≥8 GB memory allocated, you can speed up compilation:
-```bash
-DREAMPLACE_MAKE_JOBS=4 ./run_mac.sh install
+After these three commands, `install/` contains the fully installed DREAMPlace
+and benchmark data in `install/benchmarks/`.
+
+### What `build-image` does
+
+```
+docker build --platform linux/arm64 -f Dockerfile.mac -t dreamplace-mac:latest .
 ```
 
-### What the Install Command Does
+The Dockerfile (`Dockerfile.mac`) installs:
 
-The `install` command runs this sequence inside the container:
+| Package | Source | Notes |
+|---------|--------|-------|
+| Ubuntu 22.04 (ARM64) | Docker Hub | Base image |
+| GCC 11, CMake 3.22 | `apt` | Build toolchain |
+| Bison 3.8, Flex, Boost 1.74 | `apt` | Parser / library deps |
+| Python 3.10 + pip | `apt` | Runtime |
+| PyTorch CPU-only (linux_aarch64) | PyTorch WHL index | `torch.cuda.is_available() == False` |
+| SciPy ≥ 1.1.0 | pip | Required for MPC SLSQP solver |
+| NumPy ≥ 1.15.4, matplotlib, cairocffi | pip | DREAMPlace runtime deps |
+| torch_optimizer 0.3.0, ncg_optimizer 0.2.2 | pip | Additional optimizers |
+
+CPU-only PyTorch causes CMake to detect `TORCH_ENABLE_CUDA=0` automatically,
+skipping all CUDA kernel compilation.
+
+### What `install` does (inside Docker)
 
 ```bash
-# 1. Auto-detect PyTorch C++ ABI (critical: PyTorch 2.x ARM64 uses ABI=1)
+# Step 1: Initialize git submodules (pybind11, Limbo, OpenTimer, …)
+git submodule update --init --recursive --jobs 4
+
+# Step 2: Detect PyTorch C++ ABI (critical — mismatch causes linker errors)
 TORCH_CXX_ABI=$(python3 -c 'import torch; print(int(torch.compiled_with_cxx11_abi()))')
 
-# 2. CMake configure
+# Step 3: CMake configure
 mkdir -p build && cd build
 cmake .. \
   -DCMAKE_INSTALL_PREFIX=/DREAMPlace/install \
@@ -309,454 +382,414 @@ cmake .. \
   -DENABLE_HETEROSTA=OFF \
   -DPython_EXECUTABLE=$(which python3)
 
-# 3. Compile all ops (C++/CUDA extensions + pure Python)
-make -j${MAKE_JOBS}
+# Step 4: Compile
+make -j${MAKE_JOBS}      # MAKE_JOBS defaults to 2; override with DREAMPLACE_MAKE_JOBS
 
-# 4. Install to ./install/
-make install
+# Step 5: Install
+make install             # copies all Python files + compiled .so to install/
 ```
 
-The `install/` directory after install contains:
-```
-install/
-├── dreamplace/          Python package (all .py files including new BeyondPPA files)
-│   ├── Placer.py
-│   ├── BeyondPPAObj.py
-│   ├── MPCController.py
-│   ├── ops/
-│   │   ├── macro_density/
-│   │   ├── io_keepout/
-│   │   ├── macro_align/
-│   │   ├── macro_notch/
-│   │   └── [compiled .so files for C++ ops]
-│   └── params.json
-├── test/                Test configs (including adaptec1_mpc.json)
-└── benchmarks/          Downloaded circuit benchmarks
-```
+The `install/` directory contains a fully self-contained copy of DREAMPlace
+(Python modules + compiled C++ extensions + benchmark test configs).
 
-### Why the New Ops Don't Require Recompilation
+### What `make install` does for the 4 new ops
 
-All four BeyondPPA penalty ops are **pure Python** (PyTorch autograd only — no C++ extensions). Their `CMakeLists.txt` files only register the `.py` files for `make install`:
-
+The new ops are **pure Python** — no C++ compilation occurs. Each op's
+`CMakeLists.txt` uses:
 ```cmake
-# Example: dreamplace/ops/macro_density/CMakeLists.txt
-set(OP_NAME macro_density)
-# Pure Python op — no C++ compilation needed.
 file(GLOB INSTALL_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.py)
 install(FILES ${INSTALL_SRCS} DESTINATION dreamplace/ops/${OP_NAME})
 ```
+This copies `macro_density.py`, `io_keepout.py`, etc. into
+`install/dreamplace/ops/<op_name>/`.
 
-The `dreamplace/ops/CMakeLists.txt` registers all four at lines 39–43:
-```cmake
-# BeyondPPA reliability feature ops (pure Python, no C++ compilation)
-add_subdirectory(io_keepout)
-add_subdirectory(macro_align)
-add_subdirectory(macro_notch)
-add_subdirectory(macro_density)
-```
-
-### Useful Maintenance Commands
+### Reinstall (keep image, rebuild DREAMPlace)
 
 ```bash
-# Check current state (Docker image, build dir, install dir, submodules)
-./run_mac.sh status
-
-# Open interactive shell inside the container (for debugging)
-./run_mac.sh shell
-
-# Wipe build/ and install/, then rebuild from source
 ./run_mac.sh reinstall
+```
 
-# Wipe everything including Docker image
+This wipes `build/` and `install/`, then runs `install` again.
+
+### Full reset
+
+```bash
 ./run_mac.sh nuke
-./run_mac.sh build-image && ./run_mac.sh install
+./run_mac.sh build-image
+./run_mac.sh install
+```
+
+### Status check
+
+```bash
+./run_mac.sh status
+```
+
+Prints: Docker image state, build/ existence, install/ + Placer.py existence,
+submodule status.
+
+### Interactive debug shell
+
+```bash
+./run_mac.sh shell
+# Opens bash inside the container at /DREAMPlace
+# Useful for: python3 -c "import dreamplace; ...", inspecting logs, etc.
 ```
 
 ---
 
-## 6. Running Experiments (Two Modes)
+## 8. Running Experiments
 
-All placement runs go through `./run_mac.sh run <config.json>`.
+Both modes are run via `./run_mac.sh run <config.json>`. The script:
+1. Checks the Docker image exists (auto-builds if not)
+2. Checks `install/` exists
+3. Creates a temporary copy of the config with `gpu` forced to `0`
+4. Runs `python3 dreamplace/Placer.py <tmp_config>` from inside `install/`
+5. Deletes the temporary config
 
-**What `run` does internally:**
-1. Starts the Docker container with `./install/` as the working directory
-2. Creates a temporary copy of the config JSON with `"gpu": 0` forced (CPU-only build cannot use GPU)
-3. Runs `python3 dreamplace/Placer.py <temp_config.json>`
-4. Cleans up the temp file
+The GPU override is transparent — you never need to manually edit JSON files.
 
-### Mode 1 — Baseline DREAMPlace
-
-Standard wirelength + density placement. No BeyondPPA or MPC.
+### Mode 1: Baseline DREAMPlace
 
 ```bash
 ./run_mac.sh run test/ispd2005/adaptec1.json
 ```
 
-### Mode 2 — BeyondPPA + MPC (Reliability-Aware)
+Config: `test/ispd2005/adaptec1.json` (existing, unmodified stock file)
+What runs: HPWL + density penalty only. BeyondPPA and MPC are disabled
+(`beyond_ppa_flag` and `mpc_flag` default to 0).
 
-Full BeyondPPA reliability penalty terms + online MPC weight control.
+### Mode 2: BeyondPPA + MPC
 
 ```bash
 ./run_mac.sh run test/ispd2005/adaptec1_mpc.json
 ```
 
-### The adaptec1_mpc.json Config
+Config: `test/ispd2005/adaptec1_mpc.json`
 
 ```json
 {
-    "aux_input": "benchmarks/ispd2005/adaptec1/adaptec1.aux",
-    "gpu": 1,
-    "num_bins_x": 512,
-    "num_bins_y": 512,
-    "global_place_stages": [
-        {
-            "num_bins_x": 512,
-            "num_bins_y": 512,
-            "iteration": 1000,
-            "learning_rate": 0.01,
-            "wirelength": "weighted_average",
-            "optimizer": "nesterov",
-            "Llambda_density_weight_iteration": 1,
-            "Lsub_iteration": 1
-        }
-    ],
-    "target_density": 1.0,
-    "density_weight": 8e-5,
-    "gamma": 4.0,
-    "random_seed": 1000,
-    "scale_factor": 1.0,
-    "ignore_net_degree": 100,
-    "enable_fillers": 1,
-    "gp_noise_ratio": 0.025,
-    "global_place_flag": 1,
-    "legalize_flag": 1,
-    "detailed_place_flag": 1,
-    "detailed_place_engine": "",
-    "detailed_place_command": "",
-    "stop_overflow": 0.07,
-    "dtype": "float32",
-    "plot_flag": 0,
-    "random_center_init_flag": 1,
-    "gift_init_flag": 0,
-    "sort_nets_by_degree": 0,
-    "num_threads": 8,
-    "deterministic_flag": 1,
-    "beyond_ppa_flag": 1,
-    "beyond_ppa_gate_overflow": 0.20,
-    "mpc_flag": 1,
-    "mpc_interval": 50
+  "aux_input": "benchmarks/ispd2005/adaptec1/adaptec1.aux",
+  "gpu": 1,
+  "num_bins_x": 512,
+  "num_bins_y": 512,
+  "global_place_stages": [
+    {
+      "num_bins_x": 512,
+      "num_bins_y": 512,
+      "iteration": 1000,
+      "learning_rate": 0.01,
+      "wirelength": "weighted_average",
+      "optimizer": "nesterov",
+      "Llambda_density_weight_iteration": 1,
+      "Lsub_iteration": 1
+    }
+  ],
+  "target_density": 1.0,
+  "density_weight": 8e-5,
+  "gamma": 4.0,
+  "random_seed": 1000,
+  "scale_factor": 1.0,
+  "ignore_net_degree": 100,
+  "enable_fillers": 1,
+  "gp_noise_ratio": 0.025,
+  "global_place_flag": 1,
+  "legalize_flag": 1,
+  "detailed_place_flag": 1,
+  "detailed_place_engine": "",
+  "detailed_place_command": "",
+  "stop_overflow": 0.07,
+  "dtype": "float32",
+  "plot_flag": 0,
+  "random_center_init_flag": 1,
+  "gift_init_flag": 0,
+  "sort_nets_by_degree": 0,
+  "num_threads": 8,
+  "deterministic_flag": 1,
+  "beyond_ppa_flag": 1,
+  "beyond_ppa_gate_overflow": 0.20,
+  "mpc_flag": 1,
+  "mpc_interval": 50
 }
 ```
 
-**Key BeyondPPA/MPC settings:**
-- `beyond_ppa_flag: 1` — enables all four reliability penalty ops
-- `beyond_ppa_gate_overflow: 0.20` — BeyondPPA features activate when overflow drops below 20% (slightly tighter than default 30% to activate features earlier in the run)
-- `mpc_flag: 1` — enables online MPC weight control
-- `mpc_interval: 50` — MPC re-plans every 50 Llambda iterations
-
-**Note:** The `"gpu": 1` in the config is overridden to `0` by the `run_mac.sh run` command automatically.
-
-### Running Other Benchmarks
-
-Any benchmark from ISPD 2005 can run in BeyondPPA+MPC mode by adding the four BeyondPPA fields to its JSON:
-
-```bash
-# Copy an existing config and add BeyondPPA+MPC flags
-cp test/ispd2005/bigblue1.json test/ispd2005/bigblue1_mpc.json
-# Then add to bigblue1_mpc.json:
-#   "beyond_ppa_flag": 1,
-#   "beyond_ppa_gate_overflow": 0.20,
-#   "mpc_flag": 1,
-#   "mpc_interval": 50
-
-./run_mac.sh run test/ispd2005/bigblue1_mpc.json
-```
+Note: `gpu=1` in the file is automatically overridden to `gpu=0` by `run_mac.sh`.
+All BeyondPPA and MPC parameters not listed use their `params.json` defaults
+(see Section 12).
 
 ---
 
-## 7. Implementation Reference — New Files
+## 9. Implementation Reference — New Files
 
-### `dreamplace/BeyondPPAObj.py`
-
-**Purpose:** Combined BeyondPPA reliability objective. Instantiated once in `PlaceObj.__init__` when `beyond_ppa_flag=1`. Encapsulates all four penalty ops with overflow gating, linear ramp, and log-space weight management.
-
-**Class:** `BeyondPPAObj(nn.Module)`
-
-**Key attributes:**
-```python
-self.enabled       = False          # True once overflow < gate_overflow
-self.gate_overflow = 0.20           # from params.beyond_ppa_gate_overflow
-self.ramp_iters    = 50             # from params.beyond_ppa_ramp_iters
-self._ramp_step    = 0              # counts gradient steps since activation
-self._log_w        = [log(w) for w in beyond_ppa_weights]  # 4 values: density, io, align, notch
-self.density_op    = MacroDensityUniformityOp(...)
-self.io_op         = IOKeepoutOp(...)
-self.align_op      = MacroGridAlignOp(...)
-self.notch_op      = MacroNotchOp(...)
-```
-
-**`__init__(params, placedb, data_collections)`:**
-- Detects macros: `placedb.movable_macro_mask` (numpy bool array, already computed by PlaceDB)
-- Converts mask to `torch.BoolTensor`
-- Extracts macro sizes: `node_size_x/y[:num_movable][macro_mask_np]`
-- Extracts IO port positions: `node_x/y[num_movable : num_movable + num_terminals]`
-- Derives geometry from params × `placedb.row_height`: `keepout_dist`, `notch_thresh`, `pitch_x/y`
-- Builds all 4 ops
-
-**`check_and_enable(overflow)`:** Called every Llambda step. One-time transition from disabled to enabled once `float(overflow) < self.gate_overflow`. Logs the activation event.
-
-**`_ramp_scale()`:** Returns a linear scale factor 0→1 over `ramp_iters` calls. Ensures BeyondPPA cost doesn't suddenly jump when first activated.
-
-**`update_weights_log(delta_log)`:** MPC interface. Applies EMA-smoothed log-space increments to each weight:
-```python
-self._log_w[i] += EMA_ALPHA * clip(delta_log[i], ±MAX_DELTA)
-# EMA_ALPHA = 0.20  (80% history, 20% new signal)
-# MAX_DELTA = 0.095  (≈±10% per call)
-```
-
-**`forward(pos)`:**
-```python
-def forward(self, pos):
-    # Always compute raw costs (cheap for small N_macro)
-    with torch.set_grad_enabled(self.enabled):
-        raw = {
-            'density': self.density_op(pos),
-            'io':      self.io_op(pos),
-            'align':   self.align_op(pos),
-            'notch':   self.notch_op(pos),
-        }
-    if not self.enabled:
-        return pos.new_zeros(()), {k: v.detach() for k, v in raw.items()}
-
-    ramp = self._ramp_scale()
-    w    = [exp(lw) for lw in self._log_w]   # [density, io, align, notch]
-    total = ramp * (w[0]*raw['density'] + w[1]*raw['io'] + w[2]*raw['align'] + w[3]*raw['notch'])
-    return total, {k: v.detach() for k, v in raw.items()}
-    # total → flows into backward pass (gradient computed)
-    # raw   → detached, used for MPC state observation and logging
-```
-
----
-
-### `dreamplace/MPCController.py`
-
-**Purpose:** Online receding-horizon controller that adapts all BeyondPPA feature weights and the density weight during global placement.
-
-**Class:** `MPCController`
-
-**Dimensions:**
-- `STATE_DIM = 6`: `[overflow, Δhpwl_norm, density_raw, io_raw, align_raw, notch_raw]`
-- `CONTROL_DIM = 5`: `[dw_log, Δlog_density, Δlog_io, Δlog_align, Δlog_notch]`
-  - All are log-space increments (avoid negative weights, numerically stable)
-
-**`__init__(params)`:**
-```python
-self.H        = 5          # prediction horizon
-self.interval = 50         # Llambda iterations between re-plans
-self.hist_sz  = 200        # max ring-buffer size
-self.ridge    = 1e-3       # regularisation coefficient
-
-# Linear dynamics model (starts as identity, updated by fit())
-self.A = eye(STATE_DIM)
-self.B = zeros(STATE_DIM, CONTROL_DIM)
-self.c = zeros(STATE_DIM)
-
-# Reference state: target overflow = stop_overflow (0.07), all penalties → 0
-self.s_ref = [stop_overflow, 0, 0, 0, 0, 0]
-
-# Cost matrices
-self.Q = diag(mpc_q_weights)   # [10, 1, 2, 3, 3, 3]
-self.R = diag(mpc_r_weights)   # [0.1, 0.1, 0.1, 0.1, 0.1]
-
-# Density-weight anchoring
-self._dw_log_offset     = 0.0
-self._dw_log_offset_max = log(10)   # max 10× from base
-```
-
-**`record(s_t, u_t, s_next)`:** Appends `(state, control, next_state)` to ring buffer. Evicts oldest if full.
-
-**`fit()`:**
-- Requires `>= MIN_HISTORY (15)` samples
-- Checks excitation: `U.std(axis=0).mean() >= MIN_EXCITATION (1e-6)`
-- Builds design matrix `X = [s; u; 1]` ∈ R^{N × (S+C+1)}
-- Ridge regression: `θ = (X^T X + λI)^{-1} X^T Y`
-- Extracts `A, B, c` from θ
-
-**`_normalize(s)`:** Divides each state component by fixed design-time scale estimates:
-```python
-scales = [1.0, 0.05, 1.0, 1e4, 1e2, 1e4]
-# overflow, Δhpwl_norm, density_raw, io_raw, align_raw, notch_raw
-```
-
-**`step(current_state, current_u)`:**
-- Returns `zeros` if model not fitted or excitation too low (safe fallback)
-- Normalises state via `_normalize()`
-- Solves H-step SLSQP:
-  ```
-  min_{U ∈ R^{H×C}}  Σ_{i=0}^{H-1} (s_i - s_ref_n)^T Q (s_i - s_ref_n) + u_i^T R u_i
-  s.t.  u_i ∈ [-MAX_DELTA, +MAX_DELTA]^C
-  ```
-- Returns `U[0]` (first action of optimal sequence)
-- Falls back to `zeros` on any scipy exception
-
-**`apply_density_weight_delta(base, delta_log)`:**
-```python
-self._dw_log_offset = clip(self._dw_log_offset + delta_log, ±dw_log_offset_max)
-return float(base) * exp(self._dw_log_offset)
-# Bounded: density_weight stays in [base/10, base×10]
-```
-
----
-
-### `dreamplace/ops/macro_density/macro_density.py`
-
-**Purpose:** Penalises uneven macro distribution → reduces IR-drop hotspots.
+### 9.1 `dreamplace/ops/macro_density/macro_density.py`
 
 **Class:** `MacroDensityUniformityOp(nn.Module)`
 
-**Cost function:**
-```
-density_map[b] = Σ_{macro i} bilinear_weight(center_i → bin_b)
-Loss = Var(density_map)
-```
+**Purpose:** Measure how unevenly macros are distributed across the chip.
+Penalise clustering (high variance → IR-drop hotspots).
 
-**`__init__`:** Stores `macro_mask`, `macro_size_x/y`, bin grid parameters. Uses `register_buffer()` for all tensors so they move to GPU if needed.
-
-**`forward(pos)`:**
+**Constructor parameters:**
 ```python
-x = pos[:num_movable][macro_mask]
-y = pos[num_phys : num_phys+num_movable][macro_mask]
-
-if N == 0: return pos.new_zeros(())
-
-# Fractional bin coordinates
-fx = ((x - xl) / bin_w).clamp(0, BX - 1 - 1e-6)
-fy = ((y - yl) / bin_h).clamp(0, BY - 1 - 1e-6)
-
-# Bilinear weights
-w00 = (1-dx)*(1-dy)*area;  w10 = dx*(1-dy)*area
-w01 = (1-dx)*dy*area;      w11 = dx*dy*area
-
-# Out-of-place scatter_add (autograd-safe)
-indices = cat([iy*BX+ix, iy*BX+ix1, iy1*BX+ix, iy1*BX+ix1])
-weights = cat([w00, w10, w01, w11])
-density = zeros(BX*BY, ...).scatter_add(0, indices, weights)
-
-return density.var()
+MacroDensityUniformityOp(
+    macro_mask,          # BoolTensor [N_movable] — True for macro nodes
+    macro_size_x,        # float tensor [N_macro] — widths
+    macro_size_y,        # float tensor [N_macro] — heights
+    num_movable_nodes,   # int
+    num_physical_nodes,  # int — used to index y-section of pos tensor
+    num_bins_x,          # int — grid resolution (default 32)
+    num_bins_y,          # int — grid resolution (default 32)
+    xl, xh, yl, yh       # float — layout bounding box
+)
 ```
 
-**Key design note:** Uses **out-of-place** `scatter_add` (not in-place `scatter_add_`). In-place ops on leaf tensors or tensors in the autograd graph can corrupt gradient computation. This is Fix 1 from the original plan.
+**`forward(pos)` logic:**
+1. Extract macro x, y from pos (using macro_mask and correct index ranges)
+2. Compute fractional bin coordinates `fx, fy`
+3. Compute per-macro area weight (capped at 1.0 per bin)
+4. Compute four bilinear corner weights `w00, w10, w01, w11`
+5. Scatter-add weights into a flat `[num_bins_x * num_bins_y]` density vector
+   using out-of-place `scatter_add` (safe for autograd, no in-place mutation)
+6. Return `density.var()` — the variance is the cost
+
+**Key implementation note:** Uses `scatter_add` (not `scatter_add_`) to keep the
+graph differentiable through the scatter operation.
 
 ---
 
-### `dreamplace/ops/io_keepout/io_keepout.py`
-
-**Purpose:** Penalises macros within `keepout_dist` of any fixed IO terminal → reduces noise coupling and signal integrity violations.
+### 9.2 `dreamplace/ops/io_keepout/io_keepout.py`
 
 **Class:** `IOKeepoutOp(nn.Module)`
 
-**Cost function:**
-```
-dists[i,j] = ||center_macro_i - pos_io_j||_2
-Loss = Σ_{i,j} ReLU(keepout_dist - dists[i,j])^2
-```
+**Purpose:** Penalise macro centres that are closer than `keepout_dist` to any
+fixed IO terminal. Prevents noise coupling and signal integrity violations.
 
-**`forward(pos)`:**
+**Constructor parameters:**
 ```python
-x = pos[:num_movable][macro_mask]
-y = pos[num_phys : num_phys+num_movable][macro_mask]
-
-if N == 0 or N_io == 0: return pos.new_zeros(())
-
-macro_centers = stack([x, y], dim=1)        # [N_macro, 2]
-io_pos = self.io_pos.to(dtype=x.dtype, device=x.device)
-dists = torch.cdist(macro_centers, io_pos)  # [N_macro, N_io] — batched L2
-viol  = F.relu(self.keepout_dist - dists)
-return viol.pow(2).sum()
+IOKeepoutOp(
+    macro_mask,          # BoolTensor [N_movable]
+    io_x, io_y,          # float tensors — fixed IO terminal positions
+    keepout_dist,        # float — minimum allowed distance (layout units)
+    num_movable_nodes,   # int
+    num_physical_nodes   # int
+)
 ```
+
+IO positions stored as `[N_io, 2]` buffer; never updated (terminals are fixed).
+
+**`forward(pos)` logic:**
+1. Extract macro centres (x, y) from pos
+2. Stack into `[N_macro, 2]` tensor
+3. Compute pairwise L2 distances: `torch.cdist(macro_centers, io_pos)` → `[N_macro, N_io]`
+4. Compute violations: `viol = ReLU(keepout_dist − dist)`
+5. Return `viol.pow(2).sum()`
+
+**Complexity:** O(N_macro × N_IO) — small for ISPD benchmarks.
 
 ---
 
-### `dreamplace/ops/macro_align/macro_align.py`
-
-**Purpose:** Penalises macro positions that don't align to a virtual grid → improves clock-tree synthesis regularity.
+### 9.3 `dreamplace/ops/macro_align/macro_align.py`
 
 **Class:** `MacroGridAlignOp(nn.Module)`
 
-**Cost function:**
-```
-Loss = Σ_i [ sin²(π·x_i/pitch_x) + sin²(π·y_i/pitch_y) ]
-```
-- Energy = 0 exactly at grid multiples of `pitch_x/y`
-- Smooth, nonzero, and finite everywhere else
-- Gradient always points toward nearest grid line
+**Purpose:** Guide macros toward a virtual placement grid using a smooth periodic
+potential. Aligned macros improve clock-tree synthesis regularity.
 
-**`forward(pos)`:**
+**Constructor parameters:**
 ```python
-x = pos[:num_movable][macro_mask]
-y = pos[num_phys : num_phys+num_movable][macro_mask]
+MacroGridAlignOp(
+    macro_mask,          # BoolTensor [N_movable]
+    pitch_x, pitch_y,    # float — grid pitch in layout units (= N × row_height)
+    num_movable_nodes,   # int
+    num_physical_nodes   # int
+)
+```
 
-if N == 0: return pos.new_zeros(())
-
-loss_x = torch.sin(pi * x / self.pitch_x).pow(2)
-loss_y = torch.sin(pi * y / self.pitch_y).pow(2)
+**`forward(pos)` logic:**
+```python
+loss_x = torch.sin(π * x / pitch_x).pow(2)
+loss_y = torch.sin(π * y / pitch_y).pow(2)
 return (loss_x + loss_y).sum()
 ```
 
+Energy profile: 0 at grid multiples, 1.0 at half-pitch, smooth everywhere.
+Gradients point toward the nearest grid line in both axes independently.
+
 ---
 
-### `dreamplace/ops/macro_notch/macro_notch.py`
-
-**Purpose:** Penalises narrow gaps (notches) between macro pairs → reduces EM violations and routing congestion.
+### 9.4 `dreamplace/ops/macro_notch/macro_notch.py`
 
 **Class:** `MacroNotchOp(nn.Module)`
 
-**Cost function (per macro pair i, j where i < j):**
-```
-dx_gap = max(0, |cx_i - cx_j| - (w_i + w_j)/2)   ← horizontal clearance
-dy_gap = max(0, |cy_i - cy_j| - (h_i + h_j)/2)   ← vertical clearance
-d_ij   = dx_gap + dy_gap                           ← total edge-to-edge gap
+**Purpose:** Penalise narrow (notch) gaps between adjacent macro pairs.
+Narrow gaps concentrate routing demand, raise EM risk, and disrupt the power
+grid.
 
-Loss = Σ_{i<j} ReLU(notch_thresh - d_ij)²
-```
-
-**`forward(pos)`:**
+**Constructor parameters:**
 ```python
-x = pos[:num_movable][macro_mask]
-y = pos[num_phys : num_phys+num_movable][macro_mask]
-
-if N < 2: return pos.new_zeros(())
-
-# Pairwise gaps [N, N]
-cx_diff = (x.unsqueeze(1) - x.unsqueeze(0)).abs()
-cy_diff = (y.unsqueeze(1) - y.unsqueeze(0)).abs()
-half_w  = (sx.unsqueeze(1) + sx.unsqueeze(0)) * 0.5
-half_h  = (sy.unsqueeze(1) + sy.unsqueeze(0)) * 0.5
-dx_gap  = F.relu(cx_diff - half_w)
-dy_gap  = F.relu(cy_diff - half_h)
-d_ij    = dx_gap + dy_gap
-
-# Optional spatial pre-filter (OFF by default — see Known Limitations)
-if self.prune:
-    centre_dist = (cx_diff.pow(2) + cy_diff.pow(2)).sqrt()
-    far_mask    = centre_dist > 2.0 * self.notch_thresh
-    d_ij        = d_ij + far_mask.float() * self.notch_thresh * 10
-
-# Upper triangle only (avoids double-counting and self-pairs)
-ut_mask = torch.ones(N, N, dtype=torch.bool, device=x.device).triu(1)
-penalty = F.relu(self.notch_thresh - d_ij[ut_mask])
-return penalty.pow(2).sum()
+MacroNotchOp(
+    macro_mask,          # BoolTensor [N_movable]
+    macro_size_x,        # float tensor [N_macro]
+    macro_size_y,        # float tensor [N_macro]
+    notch_thresh,        # float — minimum allowed edge-to-edge gap (layout units)
+    num_movable_nodes,   # int
+    num_physical_nodes,  # int
+    prune=False          # bool — enable cheap spatial pre-filter (see §15)
+)
 ```
 
-**Complexity:** O(N_macro²). For ISPD 2005 benchmarks, N_macro < 200 and this is fast.
+**`forward(pos)` logic:**
+1. Extract macro centres (x, y)
+2. Compute N×N pairwise centre differences (absolute values)
+3. Compute half-sum of widths/heights
+4. Compute Manhattan edge-to-edge gap:
+   ```python
+   dx_gap = relu(|cx_i - cx_j| - (w_i + w_j)/2)
+   dy_gap = relu(|cy_i - cy_j| - (h_i + h_j)/2)
+   d_ij = dx_gap + dy_gap
+   ```
+5. Optional prune: if `self.prune`, add large constant to d_ij for pairs with
+   L2 centre distance > 2×notch_thresh (suppresses their penalty)
+6. Apply upper-triangle mask (avoid double-counting and self-pairs)
+7. Return `relu(notch_thresh - d_ij[ut_mask]).pow(2).sum()`
+
+**Complexity:** O(N_macro²) — dense, but ISPD benchmarks have < 200 macros, so
+this is fast in practice.
+
+**Prune warning:** `prune=True` uses L2 centre distance as filter but d_ij uses
+Manhattan gaps — the filter may incorrectly include/exclude corner pairs.
+Disabled by default until a correctness-compatible filter is validated.
 
 ---
 
-## 8. Implementation Reference — Modified Files
+### 9.5 `dreamplace/BeyondPPAObj.py`
 
-### `dreamplace/PlaceObj.py`
+**Class:** `BeyondPPAObj(nn.Module)`
 
-**New in `__init__`** (after line ~275):
+**Purpose:** Wrapper that owns all four ops, applies overflow gating, linear
+ramp, and log-space weight management. This is the single object PlaceObj
+interacts with.
+
+**Constants:**
+```python
+FEAT_NAMES = ('density', 'io', 'align', 'notch')
+EMA_ALPHA  = 0.20    # in update_weights_log()
+MAX_DELTA  = 0.095   # in update_weights_log()
+```
+
+**Constructor:** Takes `(params, placedb, data_collections)`.
+- Reads `beyond_ppa_gate_overflow` (default 0.3), `beyond_ppa_ramp_iters` (default 50)
+- Identifies macros using `placedb.movable_macro_mask`
+- Extracts IO terminal positions from `placedb.node_x/y[num_movable:]`
+- Converts geometry params to layout units (multiplies by `row_height`)
+- Instantiates all four ops
+- Initialises `_log_w` from `params.beyond_ppa_weights` (default [1,1,1,1])
+
+**Key methods:**
+
+`check_and_enable(overflow)` — call once per Llambda iteration:
+```python
+if not self.enabled and overflow < self.gate_overflow:
+    self.enabled = True
+    self._ramp_step = 0
+```
+
+`_ramp_scale()` — returns linear ramp 0→1 over `ramp_iters` steps after enable.
+
+`update_weights_log(delta_log)` — called by MPC after each planning step:
+```python
+for i, d in enumerate(delta_log):      # delta_log is u_opt[1:5]
+    d_clipped = clip(d, -MAX_DELTA, MAX_DELTA)
+    self._log_w[i] += EMA_ALPHA * d_clipped
+```
+
+`forward(pos)` — always computes raw costs (even when disabled, for MPC
+observation); returns `(total_cost, raw_dict)`:
+```python
+# When disabled: total_cost is a zero tensor with no grad; raw costs tracked
+# When enabled:  total_cost = ramp × Σ_i  λ_i × raw_cost_i
+```
+
+The `total_cost` scalar is added to the placement objective in `PlaceObj.obj_fn`.
+The `raw_dict` is stored in `PlaceObj._bppa_raw` and propagated to EvalMetrics
+and the MPC state vector.
+
+---
+
+### 9.6 `dreamplace/MPCController.py`
+
+**Class:** `MPCController`
+
+**Purpose:** Online receding-horizon controller. Every `mpc_interval` Llambda
+iterations: records one transition → refits linear dynamics → runs SLSQP →
+applies optimal control.
+
+**Constants:**
+```python
+STATE_DIM    = 6
+CONTROL_DIM  = 5
+MAX_DELTA    = 0.095
+MIN_HISTORY  = 15    # transitions needed before first fit
+MIN_EXCITATION = 1e-6  # min control std to trust the fitted model
+```
+
+**Constructor** (`params`):
+- `H` = `mpc_horizon` (default 5) — planning steps ahead
+- `interval` = `mpc_interval` (default 50) — Llambda iters between MPC calls
+- `hist_sz` = `mpc_history_size` (default 200) — rolling buffer size
+- `ridge` = `mpc_ridge` (default 1e-3) — ridge regression coefficient
+- `Q` = diagonal from `mpc_q_weights` (default [10, 1, 2, 3, 3, 3])
+- `R` = diagonal from `mpc_r_weights` (default [0.1, 0.1, 0.1, 0.1, 0.1])
+- `s_ref = [stop_overflow, 0, 0, 0, 0, 0]` — target reference state
+- `_dw_log_offset_max = log(10)` — density weight bounded to ±10× base
+
+**`record(s_t, u_t, s_next)`** — appends `(s_t, u_t, s_next)` to rolling buffer.
+Pops oldest when buffer exceeds `hist_sz`.
+
+**`fit()`** — ridge regression on current buffer:
+```python
+X = [s_t | u_t | 1]  for each recorded transition   # [n, S+C+1]
+Y = [s_next]                                          # [n, S]
+XtX += ridge × I
+theta = solve(XtX, X.T @ Y)   # [S+C+1, S]
+A = theta[:S, :].T             # [S, S]
+B = theta[S:S+C, :].T          # [S, C]
+c = theta[-1, :]               # [S]
+```
+Only updates model if `n >= MIN_HISTORY`. Measures excitation as mean std of
+recent control signals.
+
+**`_normalize(s)`** — fixed scale factors for each state dimension:
+```python
+scales = [1.0, 0.05, 1.0, 1e4, 1e2, 1e4]
+s_norm = s / (scales + 1e-12)
+```
+
+**`step(current_state, current_u)`** — SLSQP optimisation:
+```python
+# If model not ready: return zeros (no change)
+# Normalize state and s_ref
+# Unroll H steps under linear dynamics
+# Minimize Σ (s_k - s_ref_n)ᵀQ(…) + u_kᵀR u_k
+# Box constraints: u ∈ [-MAX_DELTA, MAX_DELTA]^{H×C}
+# Return first H control actions clipped to [-MAX_DELTA, MAX_DELTA]
+```
+
+**`apply_density_weight_delta(base, delta_log)`**:
+```python
+self._dw_log_offset = clip(self._dw_log_offset + delta_log,
+                           -log(10), +log(10))
+return base * exp(self._dw_log_offset)
+```
+
+---
+
+## 10. Implementation Reference — Modified Files
+
+### 10.1 `dreamplace/PlaceObj.py`
+
+**What changed:** BeyondPPA objective instantiation and integration into `obj_fn`.
+
+**In `__init__`** (lines 276–280):
 ```python
 # BeyondPPA reliability objective (single instance, owned here)
 self.beyond_ppa_obj = None
@@ -765,7 +798,7 @@ if getattr(params, 'beyond_ppa_flag', 0):
     self.beyond_ppa_obj = BeyondPPAObj(params, placedb, data_collections)
 ```
 
-**New in `obj_fn(pos)`** (after line ~324, before return):
+**In `obj_fn(pos)`** (lines 326–331):
 ```python
 # BeyondPPA human-inspired reliability terms (gated by overflow)
 if self.beyond_ppa_obj is not None:
@@ -775,23 +808,30 @@ else:
     self._bppa_raw = None
 ```
 
-`self._bppa_raw` stores the raw breakdown dict `{'density', 'io', 'align', 'notch'}` — used by `EvalMetrics.evaluate()`.
+`result` already contains `HPWL + λ·density`; the BeyondPPA cost is added on
+top. When BeyondPPA is disabled (`beyond_ppa_obj is None`) or not yet activated
+(gated), `bppa_cost` is a zero tensor and does not affect gradients.
+
+`self._bppa_raw` is the raw breakdown dict — persisted across the forward pass
+so NonLinearPlace can pass it to EvalMetrics and the MPC state vector.
 
 ---
 
-### `dreamplace/NonLinearPlace.py`
+### 10.2 `dreamplace/NonLinearPlace.py`
 
-**MPC init** (after line ~124, before macro_place handling):
+**What changed:** MPC controller lifecycle, BeyondPPA gate integration, and
+mpc_flag safety warning.
+
+**MPC initialisation** (lines 125–140, inside `cmd_global_place`, once per stage):
 ```python
-# Anchor density_weight for MPC (bounded cumulative offset)
+# Anchor density_weight for MPC
 _density_weight_base = float(params.density_weight)
 
-# MPC controller (one per global placement stage)
 _mpc = None
 _mpc_prev_state = None
-_mpc_current_u  = None   # log-space control vector
+_mpc_current_u  = None
 if getattr(params, 'mpc_flag', 0) and getattr(params, 'beyond_ppa_flag', 0):
-    import scipy.optimize   # validate import early
+    import scipy.optimize           # validate import early
     from dreamplace.MPCController import MPCController
     _mpc = MPCController(params)
     _mpc_current_u = [0.0] * MPCController.CONTROL_DIM
@@ -801,19 +841,13 @@ elif getattr(params, 'mpc_flag', 0) and not getattr(params, 'beyond_ppa_flag', 0
         "Set beyond_ppa_flag=1 to enable BeyondPPA+MPC reliability mode.")
 ```
 
-**eval_ops registration** (after line ~268):
-```python
-if getattr(params, 'beyond_ppa_flag', 0) and model.beyond_ppa_obj is not None:
-    eval_ops["beyond_ppa"] = model.beyond_ppa_obj
-```
+**BeyondPPA gate + MPC update** (lines 729–797, inside Llambda loop after density
+weight update):
 
-**MPC block in Llambda loop** (after line ~714, after density_weight update):
 ```python
 # ── BeyondPPA gate + MPC weight update ───────────────
 cur_llambda_metric = Llambda_metrics[-1][-1]
-cur_overflow_scalar = float(
-    cur_llambda_metric.overflow.mean()
-    if cur_llambda_metric.overflow is not None else 1.0)
+cur_overflow_scalar = float(cur_llambda_metric.overflow.mean() ...)
 
 # Gate: activate BeyondPPA features when overflow is low enough
 if model.beyond_ppa_obj is not None:
@@ -823,17 +857,20 @@ if model.beyond_ppa_obj is not None:
 if (_mpc is not None
         and model.beyond_ppa_obj is not None
         and Llambda_flat_iteration % _mpc.interval == 0):
-    # Build 6D state vector from current metrics
-    delta_hpwl_norm = ...  # computed from prev/cur HPWL
-    raw = {}
-    if cur_llambda_metric.bppa_density is not None:
-        raw = {'density': bppa_density, 'io': bppa_io,
-               'align': bppa_align, 'notch': bppa_notch}
-    current_state = [cur_overflow_scalar, delta_hpwl_norm,
-                     raw.get('density', 0), raw.get('io', 0),
-                     raw.get('align', 0),   raw.get('notch', 0)]
 
-    # Record transition if we have a previous state
+    # Compute Δhpwl_norm from last two metrics
+    delta_hpwl_norm = (h_cur - h_prev) / max(h_prev, 1.0)
+
+    # Build state from raw BeyondPPA metrics
+    current_state = [
+        cur_overflow_scalar,
+        delta_hpwl_norm,
+        raw.get('density', 0.0),
+        raw.get('io',      0.0),
+        raw.get('align',   0.0),
+        raw.get('notch',   0.0),
+    ]
+
     if _mpc_prev_state is not None:
         _mpc.record(_mpc_prev_state, _mpc_current_u, current_state)
         _mpc.fit()
@@ -842,8 +879,9 @@ if (_mpc is not None
     u_opt = _mpc.step(current_state, _mpc_current_u)
     _mpc_current_u = u_opt.tolist()
 
-    # Apply density-weight delta (anchored, bounded)
-    new_dw = _mpc.apply_density_weight_delta(_density_weight_base, float(u_opt[0]))
+    # Apply density-weight delta (anchored)
+    new_dw = _mpc.apply_density_weight_delta(
+        _density_weight_base, float(u_opt[0]))
     with torch.no_grad():
         model.density_weight.fill_(new_dw)
 
@@ -854,11 +892,17 @@ if (_mpc is not None
     logging.info("MPC step iter=%d  u=%s  dw=%.3E  bppa_w=%s" % (...))
 ```
 
+**Key timing:** The MPC block runs *after* the Llambda density-weight update but
+*before* the Llambda stop criterion check. This ensures MPC's density weight
+override is used for the next Lsub sub-loop.
+
 ---
 
-### `dreamplace/EvalMetrics.py`
+### 10.3 `dreamplace/EvalMetrics.py`
 
-**New fields in `__init__`** (lines 39–43):
+**What changed:** Added four BeyondPPA metric fields and their logging/evaluation.
+
+**In `__init__`** (lines 39–43):
 ```python
 # BeyondPPA reliability metrics (raw, unweighted)
 self.bppa_density = None
@@ -867,17 +911,17 @@ self.bppa_align   = None
 self.bppa_notch   = None
 ```
 
-**New in `__str__`** (lines 94–97):
+**In `__str__`** (lines 94–97):
 ```python
 if self.bppa_density is not None:
     content += ", BPPA[dens=%.3E io=%.3E align=%.3E notch=%.3E]" % (
-        self.bppa_density, self.bppa_io, self.bppa_align, self.bppa_notch)
+        self.bppa_density, self.bppa_io,
+        self.bppa_align,   self.bppa_notch)
 ```
 
-**New in `evaluate()`** (lines 150–157):
+**In `evaluate()`** (lines 150–157):
 ```python
 if "beyond_ppa" in ops:
-    # called within torch.no_grad() — raw values are already detached
     _, raw = ops["beyond_ppa"](var)
     self.bppa_density = float(raw['density'])
     self.bppa_io      = float(raw['io'])
@@ -887,217 +931,321 @@ if "beyond_ppa" in ops:
 
 ---
 
-### `dreamplace/params.json`
+### 10.4 `dreamplace/params.json`
 
-Seventeen new parameters added at lines 309–376 (before the closing `}`). They follow the existing schema `{"description": "...", "default": ...}`. The `Params.py` loader reads these automatically — no code change to `Params.py` required.
+**What changed:** 17 new parameter entries added at the end of the JSON object
+(lines 309–376).
+
+Full list with defaults: see Section 12.
 
 ---
 
-## 9. Parameters Reference
+### 10.5 `dreamplace/ops/CMakeLists.txt`
 
-### How Parameters Work
+**What changed:** Four `add_subdirectory` calls added at the end (lines 39–43):
 
-`Params.py.__init__()` reads `params.json` and stores every key as `self.__dict__[key] = value['default']`. When a user JSON config is loaded, `Params.load()` calls `fromJson()` which overwrites with user-specified values. Thus:
-- Any key in `params.json` with a `"default"` is always available on the `params` object
-- User config only needs to specify values that differ from defaults
-- New BeyondPPA/MPC keys are loaded automatically — no manual `Params.py` changes needed
+```cmake
+# BeyondPPA reliability feature ops (pure Python, no C++ compilation)
+add_subdirectory(io_keepout)
+add_subdirectory(macro_align)
+add_subdirectory(macro_notch)
+add_subdirectory(macro_density)
+```
+
+Each new op's `CMakeLists.txt` is identical in structure:
+```cmake
+set(OP_NAME macro_density)   # (or io_keepout, macro_align, macro_notch)
+
+# Pure Python op — no C++ compilation needed.
+file(GLOB INSTALL_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.py)
+install(FILES ${INSTALL_SRCS} DESTINATION dreamplace/ops/${OP_NAME})
+```
+
+---
+
+## 11. Build System Details
+
+### How DREAMPlace's CMake works
+
+The top-level `CMakeLists.txt`:
+1. Detects PyTorch installation via `find_package(Torch)`
+2. Checks `torch.cuda.is_available()` — sets `TORCH_ENABLE_CUDA` accordingly
+3. For each op subdirectory that has C++ sources: compiles a pybind11 extension
+   module (`.so`) using `add_custom_command`/`add_custom_target`
+4. `make install` copies all Python files and compiled `.so` files to
+   `CMAKE_INSTALL_PREFIX/dreamplace/ops/<op_name>/`
+
+### Why the new ops require no C++
+
+All four new ops are implemented in pure Python (PyTorch `nn.Module`). PyTorch's
+autograd differentiates through `scatter_add`, `cdist`, `sin`, `relu`, and
+standard tensor ops natively. No C++/CUDA kernels are needed.
+
+This means:
+- No pybind11 binding code
+- No `.cu` CUDA files
+- No ABI compatibility issues
+- `make install` simply copies `.py` files
+
+### ABI detection (important for Apple Silicon)
+
+```bash
+TORCH_CXX_ABI=$(python3 -c 'import torch; print(int(torch.compiled_with_cxx11_abi()))')
+cmake .. -DCMAKE_CXX_ABI=${TORCH_CXX_ABI} ...
+```
+
+PyTorch 2.x on ARM64 Ubuntu 22.04 uses the new C++11 ABI (`_GLIBCXX_USE_CXX11_ABI=1`).
+The original DREAMPlace CMakeLists defaults to ABI=0 (old ABI). Without this
+auto-detect step, all C++ extension modules produce undefined-symbol linker errors.
+`run_mac.sh install` handles this automatically.
+
+### Submodule initialisation
+
+DREAMPlace uses git submodules for: `pybind11`, `Limbo` (parser), `OpenTimer`,
+and others. The script checks for `thirdparty/pybind11/CMakeLists.txt` on both
+the host and inside Docker to detect missing submodule content reliably.
+
+---
+
+## 12. Parameters Reference
+
+All parameters belong to the `dreamplace/params.json` schema.
+DREAMPlace's `Params.py` reads this file and sets attributes on the `params`
+object. All new parameters are accessed via `getattr(params, 'name', default)`
+to be backwards-compatible with configs that don't mention them.
 
 ### BeyondPPA Parameters
 
-| JSON Key | Default | Type | Description |
-|----------|---------|------|-------------|
-| `beyond_ppa_flag` | `0` | int | Set to `1` to enable BeyondPPA reliability features |
-| `beyond_ppa_weights` | `[1,1,1,1]` | list[float] | Initial weights for `[density, io, align, notch]` features |
-| `beyond_ppa_gate_overflow` | `0.3` | float | BeyondPPA activates when global overflow drops below this value |
-| `beyond_ppa_ramp_iters` | `50` | int | Number of gradient steps to linearly ramp weight 0→1 after activation |
-| `beyond_ppa_macro_bins` | `32` | int | Coarse density grid resolution (N×N); higher = more detail, slower |
-| `beyond_ppa_prune_notch` | `0` | int | Spatial pruning for MacroNotchOp (see Known Limitations — OFF by default) |
-| `io_keepout_distance` | `10` | float | IO keepout distance in units of `placedb.row_height` |
-| `grid_alignment_pitch_x` | `8` | float | Grid pitch X in units of `placedb.row_height` |
-| `grid_alignment_pitch_y` | `8` | float | Grid pitch Y in units of `placedb.row_height` |
-| `notch_threshold` | `5` | float | Minimum allowed edge-to-edge gap between macros in units of `placedb.row_height` |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `beyond_ppa_flag` | int (0/1) | `0` | Master enable for BeyondPPA reliability features |
+| `beyond_ppa_weights` | list[float] | `[1.0, 1.0, 1.0, 1.0]` | Initial weights [density, io, align, notch] |
+| `beyond_ppa_gate_overflow` | float | `0.3` | BeyondPPA activates when `overflow < this` |
+| `beyond_ppa_ramp_iters` | int | `50` | Gradient steps to ramp from 0→1 after activation |
+| `beyond_ppa_macro_bins` | int | `32` | Coarse grid size (N×N) for density measurement |
+| `beyond_ppa_prune_notch` | int (0/1) | `0` | Enable notch pair pre-filter (disabled by default) |
+| `io_keepout_distance` | float | `10` | Keepout radius from IO ports, in units of `row_height` |
+| `grid_alignment_pitch_x` | float | `8` | Grid pitch X, in units of `row_height` |
+| `grid_alignment_pitch_y` | float | `8` | Grid pitch Y, in units of `row_height` |
+| `notch_threshold` | float | `5` | Min allowed edge-to-edge gap, in units of `row_height` |
 
 ### MPC Parameters
 
-| JSON Key | Default | Type | Description |
-|----------|---------|------|-------------|
-| `mpc_flag` | `0` | int | Set to `1` to enable MPC (requires `beyond_ppa_flag=1`) |
-| `mpc_interval` | `50` | int | Number of Llambda iterations between MPC re-planning steps |
-| `mpc_horizon` | `5` | int | MPC prediction horizon H (number of intervals to optimize ahead) |
-| `mpc_history_size` | `200` | int | Max number of (state, control, next_state) transitions in ring buffer |
-| `mpc_ridge` | `1e-3` | float | Ridge regularization λ for dynamics fitting (higher = more stable, less adaptive) |
-| `mpc_q_weights` | `[10,1,2,3,3,3]` | list[float] | Diagonal of state cost matrix Q (6 values: overflow, Δhpwl, density, io, align, notch) |
-| `mpc_r_weights` | `[0.1×5]` | list[float] | Diagonal of control cost matrix R (5 values matching CONTROL_DIM) |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mpc_flag` | int (0/1) | `0` | Enable MPC (requires `beyond_ppa_flag=1`) |
+| `mpc_interval` | int | `50` | Llambda iterations between MPC planning steps |
+| `mpc_horizon` | int | `5` | MPC prediction horizon H |
+| `mpc_history_size` | int | `200` | Max transitions in rolling dynamics buffer |
+| `mpc_ridge` | float | `1e-3` | Ridge regression regularisation coefficient |
+| `mpc_q_weights` | list[float] | `[10, 1, 2, 3, 3, 3]` | State cost Q diagonal [overflow, Δhpwl, density, io, align, notch] |
+| `mpc_r_weights` | list[float] | `[0.1, 0.1, 0.1, 0.1, 0.1]` | Control cost R diagonal [dw, density, io, align, notch] |
 
-### Derived Geometry Values
+### Cost weight interpretation
 
-The following are computed at `BeyondPPAObj.__init__` time from params × `placedb.row_height`:
+The Q weights in `mpc_q_weights` penalise deviations of each state component
+from its reference value. Higher Q → MPC prioritises reducing that component.
+The default weighting (`overflow=10, io/align/notch=3`) says:
+- Overflow convergence is the primary objective
+- Reliability metrics have moderate cost
+- HPWL change has low cost (optimiser already handles wirelength)
 
-| Value | Formula | Typical (row_height=1 unit) |
-|-------|---------|----------------------------|
-| `keepout_dist` | `io_keepout_distance × row_height` | 10 units |
-| `notch_thresh` | `notch_threshold × row_height` | 5 units |
-| `pitch_x` | `grid_alignment_pitch_x × row_height` | 8 units |
-| `pitch_y` | `grid_alignment_pitch_y × row_height` | 8 units |
+The R weights in `mpc_r_weights` penalise large control actions.
+All default to 0.1 (moderate cost), preventing aggressive weight swings.
 
 ---
 
-## 10. Expected Output & Verification
+## 13. Data Flow Walkthrough
 
-### Baseline Run Output (No BeyondPPA)
+This section traces what happens at runtime when both flags are enabled.
+
+### Startup
 
 ```
+Placer.py
+  → loads params from adaptec1_mpc.json
+  → instantiates NonLinearPlace
+      → NonLinearPlace.__init__
+          → BasicPlace.__init__ (loads PlaceDB, creates data tensors)
+```
+
+### Global placement stage entry
+
+```
+NonLinearPlace.cmd_global_place()
+  → constructs PlaceObj (PlaceObj.__init__)
+      → if beyond_ppa_flag: BeyondPPAObj(params, placedb, data_collections)
+          → identifies macro_mask from placedb.movable_macro_mask
+          → creates MacroDensityUniformityOp, IOKeepoutOp,
+                    MacroGridAlignOp, MacroNotchOp
+  → records _density_weight_base = params.density_weight
+  → if mpc_flag and beyond_ppa_flag:
+      → creates MPCController(params)
+      → _mpc_current_u = [0.0] * 5
+```
+
+### Each Lgamma step
+
+Gamma (smoothing parameter) is reduced. PlaceObj is rebuilt with updated gamma.
+
+### Each Llambda step
+
+```
+Llambda iteration:
+  → Lsub loop: multiple Nesterov gradient steps
+      → each step calls PlaceObj.obj_fn(pos):
+          → HPWL = wirelength_op(pos)
+          → Density = density_op(pos)
+          → if beyond_ppa_obj:
+              → bppa_cost, _bppa_raw = beyond_ppa_obj.forward(pos)
+                  → density_op(pos), io_op(pos), align_op(pos), notch_op(pos)
+                  → if enabled: return ramp × Σ λ_i × raw_i
+                  → if not enabled: return 0 (but raw still computed)
+              → result += bppa_cost
+          → backward() → update pos via Nesterov
+
+  → EvalMetrics.evaluate(pos)
+      → overflow_op → overflow, max_density
+      → if "beyond_ppa" in ops: → bppa_density, bppa_io, bppa_align, bppa_notch
+
+  → density_weight update (DREAMPlace default logic)
+
+  → BeyondPPA gate check:
+      → beyond_ppa_obj.check_and_enable(overflow_scalar)
+      → if newly enabled: logs "BeyondPPAObj: activated (overflow=…)"
+
+  → MPC step (if Llambda_flat_iteration % mpc_interval == 0):
+      → build current_state from overflow, Δhpwl, bppa_*
+      → _mpc.record(prev_state, prev_u, current_state)
+      → _mpc.fit()  (ridge regression, skips if < 15 samples)
+      → u_opt = _mpc.step(current_state, current_u)
+          → if not fitted or low excitation: return zeros
+          → else: SLSQP over H steps → first action
+      → new_dw = _mpc.apply_density_weight_delta(base, u_opt[0])
+      → model.density_weight.fill_(new_dw)
+      → beyond_ppa_obj.update_weights_log(u_opt[1:5])
+      → logs: "MPC step iter=… u=[…] dw=… bppa_w=[…]"
+```
+
+### After global placement
+
+Legalization and detailed placement run as normal (DREAMPlace default).
+BeyondPPA and MPC have no role after global placement — they are global
+placement tools only.
+
+---
+
+## 14. Expected Output & Verification
+
+### Baseline run (`adaptec1.json`)
+
+```
+[INFO]  iter  100, (  0,  0,  0), Obj 1.234E+09, WL 4.56E+08, Density 8.90E+08, ...
+[INFO]  iter  200, ...  Overflow 1.23E-01 ...
 ...
-iteration  100, (100, 0, 0), Obj 3.456E+07, WL 2.1E+07, Density 1.3E+07, DensityWeight 8.00E-05, wHPWL 1.8E+06, Overflow 3.456E-01, MaxDensity 9.8E-01, gamma 4.00E+01, time 0.123ms
+[INFO]  HPWL = 2.34E+07
+[INFO]  Placed in X.XX seconds
+```
+
+No BeyondPPA or MPC lines will appear.
+
+### BeyondPPA+MPC run (`adaptec1_mpc.json`)
+
+**BeyondPPA activation** (happens when overflow drops below 0.20):
+```
+[INFO]  BeyondPPAObj: 42 macro nodes identified out of 210 movable
+[INFO]  BeyondPPAObj: initial weights density=1.000 io=1.000 align=1.000 notch=1.000
 ...
+[INFO]  BeyondPPAObj: activated (overflow=0.1950 < gate=0.2000)
 ```
 
-No `BPPA` lines, no `MPC step` lines.
-
-### BeyondPPA + MPC Run Output
-
-**Initialisation (before first iteration):**
+**Per-iteration metrics** (includes BPPA breakdown after activation):
 ```
-BeyondPPAObj: 45 macro nodes identified out of 210 movable
-BeyondPPAObj: initial weights density=1.000 io=1.000 align=1.000 notch=1.000
-MPCController: H=5 interval=50 hist=200 ridge=1.00e-03
+[INFO]  iter  350, (  0,  5,  0), Obj 2.34E+09, ..., Overflow 1.89E-01, ...
+         BPPA[dens=3.45E-03 io=1.23E+04 align=5.67E+02 notch=8.90E+03], time 1.234ms
 ```
 
-**Before BeyondPPA activation (overflow > 0.20):**
+**MPC planning steps** (every 50 Llambda iterations after activation):
 ```
-iteration  150, ..., Overflow 2.500E-01, ..., time 0.145ms
-(no BPPA line — overflow still above gate)
-```
-
-**BeyondPPA activation:**
-```
-BeyondPPAObj: activated (overflow=0.1987 < gate=0.2000)
+[INFO]  MPC step iter=402  u=[0.012, -0.031, 0.045, 0.023, -0.067]
+         dw=8.123E-05  bppa_w=[1.034, 0.970, 1.046, 0.935]
 ```
 
-**After activation (each iteration):**
-```
-iteration  200, ..., Overflow 1.9E-01, ..., BPPA[dens=3.2E-02 io=1.4E+03 align=5.6E+01 notch=2.1E+02], time 0.167ms
-```
-
-**MPC re-plan (every 50 Llambda steps, first few return zeros while model fits):**
-```
-MPC step iter=50   u=[0.000, 0.000, 0.000, 0.000, 0.000] dw=8.000E-05  bppa_w=[1.000, 1.000, 1.000, 1.000]
-MPC step iter=100  u=[0.000, 0.000, 0.000, 0.000, 0.000] dw=8.000E-05  bppa_w=[1.000, 1.000, 1.000, 1.000]
-...
-MPC step iter=750  u=[0.012, -0.031, 0.008, 0.019, -0.005] dw=8.4E-05  bppa_w=[1.09, 0.84, 1.19, 0.89]
-```
-
-Note: MPC produces non-zero controls after ~15 samples × 50 interval = 750 iterations.
-
-### Pass Criteria (vs Baseline on adaptec1)
-
-| Metric | Criterion |
-|--------|-----------|
-| Final HPWL | Within ±5% of baseline |
-| `align_penalty` | < 20% of initial value by iteration 500 |
-| `notch_penalty` | < 30% of initial value by iteration 500 |
-| `io_penalty` | Near 0 if layout has IO conflicts |
-| MPC fitness | Non-zero controls after iteration 750 |
-| Runtime | < 2% overhead vs baseline |
-
-### Troubleshooting
-
-**`AttributeError: 'Params' object has no attribute 'beyond_ppa_flag'`**
-→ `params.json` wasn't updated correctly or the install step wasn't re-run after changes.
-→ Run `./run_mac.sh reinstall` to rebuild.
-
-**`BeyondPPAObj: 0 macro nodes identified`**
-→ The design has no large movable macros (area > 10× mean AND height > 2× row_height).
-→ BeyondPPA will still run but produce zero costs. This is correct behaviour.
-
-**`WARNING: mpc_flag=1 has no effect when beyond_ppa_flag=0`**
-→ Config has `mpc_flag=1` but forgot `beyond_ppa_flag=1`. Add `"beyond_ppa_flag": 1` to config.
-
-**MPC never produces non-zero controls**
-→ Fewer than 15 history samples collected (< 750 iterations total).
-→ Or: control signals have zero variation (MIN_EXCITATION check fails).
-→ Try a longer run (`"iteration": 2000`) or lower `mpc_interval` to 20.
+**What to verify:**
+1. BeyondPPA activates (the "activated" log line appears)
+2. BPPA raw metrics trend downward over time after activation
+3. MPC planning log lines appear every ~50 iterations after activation
+4. MPC density weight `dw` varies around the base value (8e-5)
+5. BeyondPPA feature weights `bppa_w` vary but stay near 1.0 (EMA + clipping)
+6. Final HPWL is not dramatically worse than baseline (< 5-10% degradation is
+   acceptable; reliability improvements cost some wirelength)
+7. No crashes, no `NaN` in objective values
 
 ---
 
-## 11. Design Decisions & Trade-offs
+## 15. Design Decisions & Trade-offs
 
-### Why Pure Python Ops (No C++/CUDA)
-
-All four BeyondPPA ops are pure PyTorch Python. This means:
-- **No recompilation** needed when modifying them
-- **Autograd handles backward pass** automatically
-- **Slightly slower** than a custom CUDA kernel, but N_macro is typically < 200, making the overhead negligible (< 2% total)
-
-### Why Log-Space Weight Control
-
-MPC emits log-space increments `Δlog(λ)` rather than absolute values. Benefits:
-- Weights remain strictly positive (exp(x) > 0 always)
-- Updates are multiplicative, not additive — more natural for scale-invariant quantities
-- Bounded increments (±MAX_DELTA = 0.095 ≈ ±10%) prevent sudden large changes
-
-### Why EMA Smoothing on Weight Updates
-
-`self._log_w[i] += EMA_ALPHA × d_clipped` (EMA_ALPHA = 0.20) means each MPC step contributes 20% to the weight while 80% of the history is retained. This prevents weight chattering when the MPC solution oscillates.
-
-### Why Overflow Gating
-
-BeyondPPA features are expensive to optimise correctly when macros are still far from their final positions (high overflow). Activating too early can cause the solver to waste gradient steps fighting the BeyondPPA terms instead of first achieving basic cell spreading. The gate at 20-30% overflow is a tuned threshold.
-
-### Why MPC in Llambda Loop (Not Lgamma)
-
-The Lgamma loop iterates over gamma reduction steps. Weight tuning only makes sense once the density penalty has begun to grow significantly (after density_weight starts being updated). The Llambda loop is where `update_density_weight_op` runs — placing the MPC block there ensures we observe the effect of weight changes before making the next re-plan.
-
-### Macro Detection Heuristic (PlaceDB.py)
-
-Macros are detected by `PlaceDB.py` (unchanged):
-```python
-movable_macro_mask = (area > mean_area × 10) AND (height > row_height × 2)
-```
-These thresholds are hardcoded and work well for ISPD 2005 circuits. Custom designs with unusual cell size distributions might require tuning.
-
-### Notch Pruning is OFF by Default
-
-The pruning filter in `MacroNotchOp` uses **L2 centre distance** as a proxy to skip "far" pairs, but the gap metric is **Manhattan-style** (sum of horizontal and vertical clearances). These are inconsistent: two macros at 45° could have a small L2 distance but large Manhattan gap, causing the filter to incorrectly skip them. The filter is available via `beyond_ppa_prune_notch=1` but requires benchmark validation before enabling.
+| Decision | Choice Made | Alternative Considered | Reason |
+|----------|------------|----------------------|--------|
+| Op implementation | Pure Python (PyTorch) | C++/CUDA kernels | ISPD macro counts (< 200) make Python fast enough; no compilation overhead |
+| Weight representation | Log-space (`_log_w`) | Linear weights | Log-space ensures weights stay positive; increments are proportionally bounded |
+| EMA smoothing | EMA_ALPHA=0.20 | Direct update | Prevents MPC from making oscillatory weight swings |
+| MPC dynamics model | Online linear (ridge regression) | Offline neural model | No pretraining data available; ridge gives stable solution with small history |
+| MPC solver | SLSQP (scipy) | QP solver, LQR | SLSQP handles box constraints natively; no extra dependencies |
+| Density-weight anchoring | log-offset from base, bounded ±log(10) | Multiplicative | Prevents unbounded compounding across many intervals |
+| BeyondPPA gating | Overflow threshold + linear ramp | Immediate activation | Prevents objective shock during early (high overflow) placement phase |
+| Notch metric | Manhattan edge-to-edge gap | L2 gap | Manhattan aligns with row-based layout routing; cheaper to compute |
+| Prune flag | Disabled by default | Enabled | L2 centre-distance filter ≠ Manhattan gap filter; corner cases incorrect |
+| Two modes only | baseline vs full BeyondPPA+MPC | Three modes (+ BeyondPPA without MPC) | Cleaner interface; MPC is cheap; no reason to run BeyondPPA without adaptive tuning |
 
 ---
 
-## 12. Known Limitations & Future Work
+## 16. Known Limitations & Future Work
 
-### Current Limitations
+### Current limitations
 
-1. **No GPU acceleration for new ops**
-   All four BeyondPPA ops are pure Python/PyTorch and run on CPU (or GPU if tensor is moved there by the rest of the system). They do not have custom CUDA kernels. For designs with thousands of macros, `MacroNotchOp` (O(N²)) could become a bottleneck.
+1. **CPU-only on Apple Silicon**: The Docker image uses CPU-only PyTorch. The 4 new
+   Python ops work on GPU too (no device-specific code), but the build system is
+   configured for CPU. To use GPU, rebuild with a CUDA-enabled PyTorch wheel.
 
-2. **Notch pruning correctness bug**
-   `beyond_ppa_prune_notch=1` uses L2 distance to filter pairs but gap is Manhattan. The filter may incorrectly prune close pairs at oblique angles. Keep this OFF until validated on ≥3 benchmarks.
+2. **Notch pruning bug**: `beyond_ppa_prune_notch=1` uses L2 centre distance to
+   filter pairs but the penalty uses Manhattan gaps. Corner pairs can be wrongly
+   included or excluded. Keep `beyond_ppa_prune_notch=0` (default) until fixed.
 
-3. **Fixed MPC state normalization scales**
-   The normalization scales in `MPCController._normalize()` are hardcoded estimates. For designs with very different density/IO/notch magnitudes, these may be suboptimal. Future: online normalization using running mean/std.
+3. **Linear dynamics assumption**: MPC assumes `s_{t+1} ≈ A·s_t + B·u_t + c`.
+   The true placement dynamics are nonlinear. The model is re-fitted online but
+   may be a poor predictor during rapid overflow change phases.
 
-4. **Linear dynamics assumption**
-   MPC assumes `s_{t+1} ≈ A·s_t + B·u_t + c`. Real placement dynamics are nonlinear. The ridge-regularised fit and bounded controls compensate, but MPC might make suboptimal decisions in highly nonlinear regimes.
+4. **No rule-based fallback**: If MPC returns zeros (model not fitted or low
+   excitation), BeyondPPA weights remain at their initial values for that
+   interval. A heuristic fallback (e.g., increase weights proportional to metric
+   magnitude) would improve early-phase reliability.
 
-5. **Macro detection thresholds are hardcoded**
-   The 10× area and 2× row_height thresholds in PlaceDB are fixed. Designs with non-standard cell libraries may produce incorrect macro detection.
+5. **Fixed normalisation scales in `_normalize`**: The MPCController normalises
+   states with hardcoded scales `[1.0, 0.05, 1.0, 1e4, 1e2, 1e4]`. These are
+   design-time estimates for ISPD 2005-class benchmarks and may be wrong for
+   other designs.
 
-### Future Work
+6. **MPC not active before overflow gate**: Even if `mpc_flag=1`, MPC does not
+   schedule weights until BeyondPPA is activated. During the early overflow-
+   reduction phase, density weight follows DREAMPlace's default schedule only.
 
-1. **CUDA kernels for hot ops**
-   `MacroNotchOp` pairwise computation is parallelisable with a simple CUDA kernel. This would be needed for designs with >500 macros.
+### Future work
 
-2. **Nonlinear MPC**
-   Replace the linear dynamics model with a small neural network (1-2 hidden layers) for better accuracy in the nonlinear convergence regime.
-
-3. **Adaptive normalization in MPC state**
-   Replace hardcoded normalization scales with online running statistics.
-
-4. **Macro detection as a parameter**
-   Expose `macro_area_multiplier` (currently 10×) and `macro_height_multiplier` (currently 2×) as JSON parameters.
-
-5. **Benchmark validation of notch pruning**
-   Verify fix for the L2/Manhattan inconsistency and enable `beyond_ppa_prune_notch=1` after validation.
+- **Benchmark on ISPD 2015, ICCAD 2019**: Measure HPWL delta, overflow delta,
+  and post-route reliability metrics vs. baseline.
+- **Validated notch pruning**: Implement a correct spatial filter using cell-
+  bbox overlap check instead of L2 centre distance.
+- **Nonlinear dynamics**: Replace linear model with a small neural network fitted
+  online (e.g., single hidden layer, low sample complexity).
+- **GPU support**: Test with a CUDA-enabled Docker build.
+- **Timing-aware feature**: Add a 5th BeyondPPA feature for critical-path macro
+  proximity (the paper's Feature 1 is HPWL, already in DREAMPlace; Feature 5
+  would be timing-driven).
+- **Hyperparameter sweep**: Q, R, mpc_horizon, mpc_interval are all manually
+  tuned for adaptec1. An automated sweep on the full ISPD suite would improve
+  generalisability.
 
 ---
 
-*End of implementation reference. Branch: `claude/beyondppa-mpc-integration-Kki4i`. Last updated: 2026-03-03.*
+*End of implementation reference.*
