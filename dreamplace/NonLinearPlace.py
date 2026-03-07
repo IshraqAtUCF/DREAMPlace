@@ -732,9 +732,14 @@ class NonLinearPlace(BasicPlace.BasicPlace):
                             cur_llambda_metric.overflow.mean()
                             if cur_llambda_metric.overflow is not None else 1.0)
 
-                        # Gate: activate BeyondPPA features when overflow is low enough
+                        # Gate: activate BeyondPPA features when overflow is low enough,
+                        # or force-enable in the last (1 - beyond_ppa_force_fraction)
+                        # of Lgamma iterations so features always participate.
                         if model.beyond_ppa_obj is not None:
-                            model.beyond_ppa_obj.check_and_enable(cur_overflow_scalar)
+                            _force_frac = float(getattr(params, 'beyond_ppa_force_fraction', 0.8))
+                            _force_bppa = (model.Lgamma_iteration > 0
+                                           and Lgamma_step >= _force_frac * model.Lgamma_iteration)
+                            model.beyond_ppa_obj.check_and_enable(cur_overflow_scalar, force=_force_bppa)
 
                         # MPC: re-plan every mpc_interval Llambda iterations
                         if (_mpc is not None
